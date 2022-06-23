@@ -2,6 +2,7 @@
 
 use crate::colors;
 use crate::config_file::ConfigFile;
+use crate::config_file::Task;
 use crate::flags::Flags;
 use crate::flags::TaskFlags;
 use crate::fs_util;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 
 fn get_tasks_config(
   maybe_config_file: Option<&ConfigFile>,
-) -> Result<BTreeMap<String, String>, AnyError> {
+) -> Result<BTreeMap<String, Task>, AnyError> {
   if let Some(config_file) = maybe_config_file {
     let maybe_tasks_config = config_file.to_tasks_config()?;
     if let Some(tasks_config) = maybe_tasks_config {
@@ -41,12 +42,15 @@ fn get_tasks_config(
   }
 }
 
-fn print_available_tasks(tasks_config: BTreeMap<String, String>) {
+fn print_available_tasks(tasks_config: BTreeMap<String, Task>) {
   eprintln!("{}", colors::green("Available tasks:"));
 
   for name in tasks_config.keys() {
     eprintln!("- {}", colors::cyan(name));
-    eprintln!("    {}", tasks_config[name])
+    eprintln!(
+      "    {}    {}",
+      tasks_config[name].run, tasks_config[name].description
+    )
   }
 }
 
@@ -89,7 +93,7 @@ pub async fn execute_script(
       .map(|a| format!("\"{}\"", a.replace('"', "\\\"").replace('$', "\\$")))
       .collect::<Vec<_>>()
       .join(" ");
-    let script = format!("{} {}", script, additional_args);
+    let script = format!("{} {}", script.run, additional_args);
     let script = script.trim();
     log::info!(
       "{} {} {}",

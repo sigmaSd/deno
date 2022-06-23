@@ -661,14 +661,15 @@ impl ConfigFile {
   /// task in a detail field.
   pub fn to_lsp_tasks(&self) -> Option<Value> {
     let value = self.json.tasks.clone()?;
-    let tasks: BTreeMap<String, String> = serde_json::from_value(value).ok()?;
+    let tasks: BTreeMap<String, Task> = serde_json::from_value(value).ok()?;
     Some(
       tasks
         .into_iter()
-        .map(|(key, value)| {
+        .map(|(key, task)| {
           json!({
             "name": key,
-            "detail": value,
+            "detail": task.run,
+            "description": task.description
           })
         })
         .collect(),
@@ -677,11 +678,10 @@ impl ConfigFile {
 
   pub fn to_tasks_config(
     &self,
-  ) -> Result<Option<BTreeMap<String, String>>, AnyError> {
+  ) -> Result<Option<BTreeMap<String, Task>>, AnyError> {
     if let Some(config) = self.json.tasks.clone() {
-      let tasks_config: BTreeMap<String, String> =
-        serde_json::from_value(config)
-          .context("Failed to parse \"tasks\" configuration")?;
+      let tasks_config: BTreeMap<String, Task> = serde_json::from_value(config)
+        .context("Failed to parse \"tasks\" configuration")?;
       Ok(Some(tasks_config))
     } else {
       Ok(None)
@@ -888,11 +888,11 @@ mod tests {
 
     let tasks_config = config_file.to_tasks_config().unwrap().unwrap();
     assert_eq!(
-      tasks_config["build"],
+      tasks_config["build"].run,
       "deno run --allow-read --allow-write build.ts",
     );
     assert_eq!(
-      tasks_config["server"],
+      tasks_config["server"].run,
       "deno run --allow-net --allow-read server.ts"
     );
   }
@@ -1099,4 +1099,11 @@ mod tests {
     let actual = actual.unwrap();
     assert_eq!(actual, None);
   }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Task {
+  pub run: String,
+  pub description: String,
 }

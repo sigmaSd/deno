@@ -1,5 +1,6 @@
 // Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
 
+use deno_core::anyhow::anyhow;
 use deno_core::error::resource_unavailable;
 use deno_core::error::AnyError;
 use deno_core::op;
@@ -19,6 +20,7 @@ use deno_core::ResourceId;
 use deno_core::ZeroCopyBuf;
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::fs::File as StdFile;
 use std::io::ErrorKind;
@@ -438,6 +440,7 @@ pub struct StdFileResource {
   // Used to keep async actions in order and only allow one
   // to occur at a time
   cell_async_task_queue: TaskQueue,
+  closed: Cell<bool>,
 }
 
 impl StdFileResource {
@@ -449,6 +452,7 @@ impl StdFileResource {
       })),
       cell_async_task_queue: Default::default(),
       name: name.to_string(),
+      closed: Cell::new(false),
     }
   }
 
@@ -460,6 +464,7 @@ impl StdFileResource {
       })),
       cell_async_task_queue: Default::default(),
       name: "fsFile".to_string(),
+      closed: Cell::new(false),
     }
   }
 
@@ -638,7 +643,23 @@ impl Resource for StdFileResource {
     Box::pin(async move {
       let vec = vec![0; limit];
       let buf = BufMutView::from(vec);
-      let (nread, buf) = self.read_byob(buf).await?;
+
+      let f = tokio::spawn(async move {
+        loop {
+          if self.closed.get() {
+            return
+          }
+        }
+      });
+      let (nread, buf) = tokio::select! {
+          r = self.read_byob(buf) => r.unwrap(),
+          _ = f => return   Err(anyhow!("Resource closed"))
+      };
+      // let (nread, buf) = match maybe_r {
+      //   Ok(r) => r,
+      //   Err(e) => return Err(e),
+      // };
+      // let (nread, buf) = self.read_byob(buf).await?;
       let mut vec = buf.unwrap_vec();
       if vec.len() != nread {
         vec.truncate(nread);
@@ -664,6 +685,10 @@ impl Resource for StdFileResource {
         Ok(std_file.with_file(|f| f.as_raw_fd()))
       })
       .ok()
+  }
+
+  fn close(self: Rc<Self>) {
+    self.closed.set(true);
   }
 }
 

@@ -6,7 +6,7 @@ type LoadAvg = (f64, f64, f64);
 const DEFAULT_LOADAVG: LoadAvg = (0.0, 0.0, 0.0);
 
 pub fn loadavg() -> LoadAvg {
-  #[cfg(target_os = "linux")]
+  #[cfg(any (target_os = "linux", target_os = "android"))]
   {
     use libc::SI_LOAD_SHIFT;
 
@@ -46,7 +46,7 @@ pub fn loadavg() -> LoadAvg {
 }
 
 pub fn os_release() -> String {
-  #[cfg(target_os = "linux")]
+  #[cfg(any (target_os = "linux", target_os = "android"))]
   {
     #[allow(clippy::disallowed_methods)]
     match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
@@ -331,7 +331,7 @@ pub fn mem_info() -> Option<MemInfo> {
 pub fn os_uptime() -> u64 {
   let uptime: u64;
 
-  #[cfg(target_os = "linux")]
+  #[cfg(any (target_os = "linux", target_os = "android"))]
   {
     let mut info = std::mem::MaybeUninit::uninit();
     // SAFETY: `info` is a valid pointer to a `libc::sysinfo` struct.

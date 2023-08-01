@@ -62,7 +62,7 @@ impl FileSystem for RealFs {
       let _ = umask(prev);
       prev
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any (target_os = "linux", target_os = "android"))]
     {
       Ok(r.bits())
     }

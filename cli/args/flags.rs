@@ -168,6 +168,7 @@ pub struct LintFlags {
   pub files: FileFlags,
   pub rules: bool,
   pub maybe_rules_tags: Option<Vec<String>>,
+  pub untagged_only: bool,
   pub maybe_rules_include: Option<Vec<String>>,
   pub maybe_rules_exclude: Option<Vec<String>>,
   pub json: bool,
@@ -1720,6 +1721,12 @@ Ignore linting a file by adding an ignore comment at the top of the file:
             .help("Use set of rules with a tag"),
         )
         .arg(
+          Arg::new("untagged-only")
+            .long("untagged-only")
+            .action(ArgAction::SetTrue)
+            .help("Only show untagged rules (should be used with --rules)"),
+        )
+        .arg(
           Arg::new("rules-include")
             .long("rules-include")
             .require_equals(true)
@@ -3201,6 +3208,7 @@ fn lint_parse(flags: &mut Flags, matches: &mut ArgMatches) {
   let maybe_rules_tags = matches
     .remove_many::<String>("rules-tags")
     .map(|f| f.collect());
+  let untagged_only = matches.get_flag("untagged-only");
 
   let maybe_rules_include = matches
     .remove_many::<String>("rules-include")
@@ -3219,6 +3227,7 @@ fn lint_parse(flags: &mut Flags, matches: &mut ArgMatches) {
     },
     rules,
     maybe_rules_tags,
+    untagged_only,
     maybe_rules_include,
     maybe_rules_exclude,
     json,
@@ -4478,6 +4487,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: None,
+          untagged_only: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: false,
@@ -4508,6 +4518,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: None,
+          untagged_only: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: false,
@@ -4541,6 +4552,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: None,
+          untagged_only: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: false,
@@ -4568,6 +4580,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: None,
+          untagged_only: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: false,
@@ -4589,6 +4602,7 @@ mod tests {
           },
           rules: true,
           maybe_rules_tags: None,
+          untagged_only: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: false,
@@ -4615,6 +4629,7 @@ mod tests {
           },
           rules: true,
           maybe_rules_tags: Some(svec!["recommended"]),
+          maybe_rules_tags: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: false,
@@ -4642,6 +4657,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: Some(svec![""]),
+          untagged_only: false,
           maybe_rules_include: Some(svec!["ban-untagged-todo", "no-undef"]),
           maybe_rules_exclude: Some(svec!["no-const-assign"]),
           json: false,
@@ -4663,6 +4679,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: None,
+          maybe_rules_tags: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: true,
@@ -4691,6 +4708,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: None,
+          untagged_only: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: true,
@@ -4720,6 +4738,7 @@ mod tests {
           },
           rules: false,
           maybe_rules_tags: None,
+          untagged_only: false,
           maybe_rules_include: None,
           maybe_rules_exclude: None,
           json: false,

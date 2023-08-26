@@ -143,6 +143,7 @@ async fn run_subcommand(flags: Flags) -> Result<i32, AnyError> {
         tools::lint::print_rules_list(
           lint_flags.json,
           lint_flags.maybe_rules_tags,
+          lint_flags.untagged_only,
         );
         Ok(())
       } else {

@@ -203,8 +203,17 @@ fn collect_lint_files(files: &FilesConfig) -> Result<Vec<PathBuf>, AnyError> {
     .collect_files(&files.include)
 }
 
-pub fn print_rules_list(json: bool, maybe_rules_tags: Option<Vec<String>>) {
-  let lint_rules = if maybe_rules_tags.is_none() {
+pub fn print_rules_list(
+  json: bool,
+  maybe_rules_tags: Option<Vec<String>>,
+  untagged_only: bool,
+) {
+  let lint_rules = if untagged_only {
+    rules::get_all_rules()
+      .into_iter()
+      .filter(|rule| rule.tags().is_empty())
+      .collect()
+  } else if maybe_rules_tags.is_none() {
     rules::get_all_rules()
   } else {
     rules::get_filtered_rules(maybe_rules_tags, None, None)

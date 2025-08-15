@@ -34,6 +34,13 @@ jobs:
           # See #9484.
           - os: ubuntu-18.04
             kind: test_release
+          # Android builds (compilation only, no tests)
+          - os: ubuntu-latest
+            kind: android_build
+            target: aarch64-linux-android
+          - os: ubuntu-latest
+            kind: android_build
+            target: armv7-linux-androideabi
 
       # Always run main branch builds to completion. This allows the cache to
       # stay mostly up-to-date in situations where a single job fails due to
@@ -177,6 +184,14 @@ jobs:
       - name: Build debug
         if: matrix.kind == 'test_debug'
         run: cargo build --locked --all-targets
+
+      - name: Install Android target
+        if: matrix.kind == 'android_build'
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build Android
+        if: matrix.kind == 'android_build'
+        run: cargo build --target ${{ matrix.target }} --locked
 
       - name: Pre-release (linux)
         if: |

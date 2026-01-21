@@ -535,9 +535,48 @@ pub fn op_open_tty_from_fd(
       return Err(JsErrorBox::type_error("File descriptor is not a TTY"));
     }
 
-    // Now duplicate it again for the resource
-    // SAFETY: Assumes fd is valid; dup safely creates a new handle without affecting the original handle's ownership
-    let final_fd = unsafe { libc::dup(fd) };
+    // Try to recover the TTY name and reopen it to get a fresh file description
+    // with default flags (blocking), because the original FD might be non-blocking
+    // (e.g. if it comes from Node.js/libuv), which would cause reads to fail with EAGAIN.
+    let mut final_fd = -1;
+    let mut buf = [0 as libc::c_char; 4096];
+    // SAFETY: buffer is large enough
+    if unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } == 0 {
+      let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+      if len > 0 {
+        // SAFETY: path came from ttyname_r and is null-terminated
+        let path = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        // Open with O_NONBLOCK to prevent blocking if carrier is missing,
+        // then clear it to ensure we have a blocking fd for FileResource.
+        // O_NOCTTY: don't make it the controlling terminal
+        // SAFETY: open call
+        final_fd = unsafe {
+          libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+          )
+        };
+
+        if final_fd >= 0 {
+          // Clear O_NONBLOCK
+          // SAFETY: fcntl call
+          let flags = unsafe { libc::fcntl(final_fd, libc::F_GETFL) };
+          if flags >= 0 {
+            // SAFETY: fcntl call
+            unsafe {
+              libc::fcntl(final_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK)
+            };
+          }
+        }
+      }
+    }
+
+    if final_fd < 0 {
+      // Fallback to dup if reopen fails
+      // SAFETY: Assumes fd is valid; dup safely creates a new handle without affecting the original handle's ownership
+      final_fd = unsafe { libc::dup(fd) };
+    }
+
     if final_fd < 0 {
       return Err(JsErrorBox::generic("Failed to duplicate file descriptor"));
     }

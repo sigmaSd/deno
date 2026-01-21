@@ -17,6 +17,10 @@ import { Socket } from "node:net";
 import { setReadStream } from "ext:deno_node/_process/streams.mjs";
 import * as io from "ext:deno_io/12_io.js";
 
+// Define symbols for ref/unref operations
+const REF = Symbol("REF");
+const UNREF = Symbol("UNREF");
+
 // Helper class to wrap a file descriptor as a stream-like object
 // Similar to Stdin/Stdout/Stderr classes in io module
 class TTYStream {
@@ -66,14 +70,14 @@ class TTYStream {
     return core.isTerminal(this.#rid);
   }
 
-  [Symbol("REF")]() {
+  [REF]() {
     this.#ref = true;
     if (this.#opPromise) {
       core.refOpPromise(this.#opPromise);
     }
   }
 
-  [Symbol("UNREF")]() {
+  [UNREF]() {
     this.#ref = false;
     if (this.#opPromise) {
       core.unrefOpPromise(this.#opPromise);

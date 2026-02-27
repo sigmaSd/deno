@@ -1,174 +1,217 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-use crate::file_fetcher::map_content_type;
-use crate::media_type::MediaType;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
+use std::path::Prefix;
+use std::str::FromStr;
 
+use deno_config::UrlToFilePathError;
 use deno_core::error::AnyError;
+use deno_core::url::Position;
 use deno_core::url::Url;
-use deno_core::ModuleSpecifier;
-use std::collections::HashMap;
+use deno_path_util::url_to_file_path;
+use lsp_types::Uri;
 
-/// This is a partial guess as how URLs get encoded from the LSP.  We want to
-/// encode URLs sent to the LSP in the same way that they would be encoded back
-/// so that we have the same return encoding.
-const LSP_ENCODING: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
-  .add(b':')
-  .add(b';')
-  .add(b'=')
-  .add(b'@')
-  .add(b'[')
-  .add(b'\\')
-  .add(b']')
-  .add(b'^')
-  .add(b'|');
+use super::logging::lsp_warn;
 
-fn hash_data_specifier(specifier: &ModuleSpecifier) -> String {
-  let mut file_name_str = specifier.path().to_string();
-  if let Some(query) = specifier.query() {
-    file_name_str.push('?');
-    file_name_str.push_str(query);
-  }
-  crate::checksum::gen(&[file_name_str.as_bytes()])
+pub fn uri_parse_unencoded(s: &str) -> Result<Uri, AnyError> {
+  url_to_uri(&Url::parse(s)?)
 }
 
-fn data_url_media_type(specifier: &ModuleSpecifier) -> MediaType {
-  let path = specifier.path();
-  let mut parts = path.splitn(2, ',');
-  let media_type_part =
-    percent_encoding::percent_decode_str(parts.next().unwrap())
-      .decode_utf8_lossy();
-  let (media_type, _) =
-    map_content_type(specifier, Some(media_type_part.into()));
-  media_type
+pub fn normalize_uri(uri: &Uri) -> Uri {
+  if !uri.scheme().as_str().eq_ignore_ascii_case("file") {
+    return uri.normalize().into();
+  }
+  let Some(path) = uri.to_file_path() else {
+    return uri.normalize().into();
+  };
+  let normalized_path = normalize_path(path);
+  let mut encoded_path =
+    fluent_uri::pct_enc::EString::<fluent_uri::pct_enc::encoder::Path>::new();
+  let mut path_only_has_prefix = false;
+  for component in normalized_path.components() {
+    match component {
+      Component::Prefix(prefix) => {
+        path_only_has_prefix = true;
+        match prefix.kind() {
+          Prefix::Disk(mut letter) | Prefix::VerbatimDisk(mut letter) => {
+            encoded_path.encode_str::<fluent_uri::pct_enc::encoder::Path>("/");
+            letter.make_ascii_uppercase();
+            let b = [letter];
+            // SAFETY: Drive letter is ascii.
+            let s = unsafe { str::from_utf8_unchecked(&b) };
+            encoded_path.encode_str::<fluent_uri::pct_enc::encoder::Path>(s);
+            encoded_path.encode_str::<fluent_uri::pct_enc::encoder::Path>(":");
+          }
+          Prefix::UNC(..) | Prefix::VerbatimUNC(..) => {
+            // These should be carried in `uri.authority()`.
+          }
+          Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+            // Not a local path, abort.
+            return uri.normalize().into();
+          }
+        }
+      }
+      Component::RootDir => {}
+      component => {
+        path_only_has_prefix = false;
+        encoded_path.encode_str::<fluent_uri::pct_enc::encoder::Path>("/");
+        encoded_path.encode_str::<fluent_uri::pct_enc::encoder::Path>(
+          &component.as_os_str().to_string_lossy(),
+        );
+      }
+    }
+  }
+  if encoded_path.is_empty() || path_only_has_prefix {
+    encoded_path.encode_str::<fluent_uri::pct_enc::encoder::Path>("/");
+  }
+  fluent_uri::Uri::builder()
+    .scheme(fluent_uri::component::Scheme::new_or_panic("file"))
+    .optional(fluent_uri::build::Builder::authority, uri.authority())
+    .path(encoded_path.as_ref())
+    .optional(fluent_uri::build::Builder::query, uri.query())
+    .optional(fluent_uri::build::Builder::fragment, uri.fragment())
+    .build()
+    .expect("component constraints should be met by the above")
+    .normalize()
+    .into()
 }
 
-/// A bi-directional map of URLs sent to the LSP client and internal module
-/// specifiers.  We need to map internal specifiers into `deno:` schema URLs
-/// to allow the Deno language server to manage these as virtual documents.
-#[derive(Debug, Default)]
-pub struct LspUrlMap {
-  specifier_to_url: HashMap<ModuleSpecifier, Url>,
-  url_to_specifier: HashMap<Url, ModuleSpecifier>,
+pub fn url_to_uri(url: &Url) -> Result<Uri, AnyError> {
+  let uri_before_path = Uri::from_str(&url[..Position::BeforePath])
+    .inspect_err(|err| {
+      lsp_warn!("Could not convert URL \"{url}\" to URI: {err}")
+    })?;
+  let mut encoded_path =
+    fluent_uri::pct_enc::EString::<fluent_uri::pct_enc::encoder::Path>::new();
+  encoded_path.encode_str::<fluent_uri::pct_enc::encoder::Path>(
+    &percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy(),
+  );
+  let encoded_query = url.query().map(|query| {
+    let mut encoded_query = fluent_uri::pct_enc::EString::<
+      fluent_uri::pct_enc::encoder::Query,
+    >::new();
+    encoded_query.encode_str::<fluent_uri::pct_enc::encoder::Query>(query);
+    encoded_query
+  });
+  let encoded_fragment = url.fragment().map(|fragment| {
+    let mut encoded_fragment = fluent_uri::pct_enc::EString::<
+      fluent_uri::pct_enc::encoder::Fragment,
+    >::new();
+    encoded_fragment
+      .encode_str::<fluent_uri::pct_enc::encoder::Fragment>(fragment);
+    encoded_fragment
+  });
+  let uri = fluent_uri::Uri::builder()
+    .scheme(uri_before_path.scheme())
+    .optional(
+      fluent_uri::build::Builder::authority,
+      uri_before_path.authority(),
+    )
+    .path(encoded_path.as_ref())
+    .optional(fluent_uri::build::Builder::query, encoded_query.as_deref())
+    .optional(
+      fluent_uri::build::Builder::fragment,
+      encoded_fragment.as_deref(),
+    )
+    .build()
+    .expect("component constraints should be met by the above")
+    .into();
+  Ok(normalize_uri(&uri))
 }
 
-impl LspUrlMap {
-  fn put(&mut self, specifier: ModuleSpecifier, url: Url) {
-    self.specifier_to_url.insert(specifier.clone(), url.clone());
-    self.url_to_specifier.insert(url, specifier);
-  }
+pub fn uri_to_url(uri: &Uri) -> Url {
+  (|| {
+    let scheme = uri.scheme();
+    if !scheme.as_str().eq_ignore_ascii_case("untitled")
+      && !scheme.as_str().eq_ignore_ascii_case("vscode-notebook-cell")
+      && !scheme.as_str().eq_ignore_ascii_case("deno-notebook-cell")
+      && !scheme.as_str().eq_ignore_ascii_case("vscode-userdata")
+    {
+      return None;
+    }
+    let mut s = String::with_capacity(uri.as_str().len());
+    s.push_str("file:///");
+    s.push_str(uri.path().as_str().trim_start_matches('/'));
+    if let Some(query) = uri.query() {
+      s.push('?');
+      s.push_str(query.as_str());
+    }
+    if let Some(fragment) = uri.fragment() {
+      s.push('#');
+      s.push_str(fragment.as_str());
+    }
+    Url::parse(&s).ok().map(normalize_url)
+  })()
+  .unwrap_or_else(|| normalize_url(Url::parse(uri.as_str()).unwrap()))
+}
 
-  fn get_url(&self, specifier: &ModuleSpecifier) -> Option<&Url> {
-    self.specifier_to_url.get(specifier)
-  }
+pub fn uri_to_file_path(uri: &Uri) -> Result<PathBuf, UrlToFilePathError> {
+  url_to_file_path(&uri_to_url(uri))
+}
 
-  fn get_specifier(&self, url: &Url) -> Option<&ModuleSpecifier> {
-    self.url_to_specifier.get(url)
-  }
+pub fn uri_is_file_like(uri: &Uri) -> bool {
+  let scheme = uri.scheme();
+  scheme.as_str().eq_ignore_ascii_case("file")
+    || scheme.as_str().eq_ignore_ascii_case("untitled")
+    || scheme.as_str().eq_ignore_ascii_case("vscode-notebook-cell")
+    || scheme.as_str().eq_ignore_ascii_case("deno-notebook-cell")
+    || scheme.as_str().eq_ignore_ascii_case("vscode-userdata")
+}
 
-  /// Normalize a specifier that is used internally within Deno (or tsc) to a
-  /// URL that can be handled as a "virtual" document by an LSP client.
-  pub fn normalize_specifier(
-    &mut self,
-    specifier: &ModuleSpecifier,
-  ) -> Result<Url, AnyError> {
-    if let Some(url) = self.get_url(specifier) {
-      Ok(url.clone())
-    } else {
-      let url = if specifier.scheme() == "file" {
-        specifier.clone()
-      } else {
-        let specifier_str = if specifier.scheme() == "data" {
-          let media_type = data_url_media_type(specifier);
-          let extension = if media_type == MediaType::Unknown {
-            ""
-          } else {
-            media_type.as_ts_extension()
-          };
-          format!(
-            "deno:/{}/data_url{}",
-            hash_data_specifier(specifier),
-            extension
-          )
+fn normalize_url(url: Url) -> Url {
+  let Ok(path) = url_to_file_path(&url) else {
+    return url;
+  };
+  let normalized_path = normalize_path(&path);
+  let Ok(mut normalized_url) = Url::from_file_path(&normalized_path) else {
+    return url;
+  };
+  if let Some(query) = url.query() {
+    normalized_url.set_query(Some(query));
+  }
+  if let Some(fragment) = url.fragment() {
+    normalized_url.set_fragment(Some(fragment));
+  }
+  normalized_url
+}
+
+// TODO(nayeemrmn): Change the version of this in deno_path_util to force
+// uppercase on drive letters. Then remove this.
+fn normalize_path<P: AsRef<Path>>(path: P) -> PathBuf {
+  fn inner(path: &Path) -> PathBuf {
+    let mut components = path.components().peekable();
+    let mut ret =
+      if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        let s = c.as_os_str();
+        if s.len() == 2 {
+          PathBuf::from(s.to_ascii_uppercase())
         } else {
-          let path = specifier.as_str().replacen("://", "/", 1);
-          let path = percent_encoding::utf8_percent_encode(&path, LSP_ENCODING);
-          format!("deno:/{}", path)
-        };
-        let url = Url::parse(&specifier_str)?;
-        self.put(specifier.clone(), url.clone());
-        url
+          PathBuf::from(s)
+        }
+      } else {
+        PathBuf::new()
       };
-      Ok(url)
+
+    for component in components {
+      match component {
+        Component::Prefix(..) => unreachable!(),
+        Component::RootDir => {
+          ret.push(component.as_os_str());
+        }
+        Component::CurDir => {}
+        Component::ParentDir => {
+          ret.pop();
+        }
+        Component::Normal(c) => {
+          ret.push(c);
+        }
+      }
     }
+    ret
   }
 
-  /// Normalize URLs from the client, where "virtual" `deno:///` URLs are
-  /// converted into proper module specifiers.
-  pub fn normalize_url(&self, url: &Url) -> ModuleSpecifier {
-    if let Some(specifier) = self.get_specifier(url) {
-      specifier.clone()
-    } else {
-      url.clone()
-    }
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use deno_core::resolve_url;
-
-  #[test]
-  fn test_hash_data_specifier() {
-    let fixture = resolve_url("data:application/typescript;base64,ZXhwb3J0IGNvbnN0IGEgPSAiYSI7CgpleHBvcnQgZW51bSBBIHsKICBBLAogIEIsCiAgQywKfQo=").unwrap();
-    let actual = hash_data_specifier(&fixture);
-    assert_eq!(
-      actual,
-      "c21c7fc382b2b0553dc0864aa81a3acacfb7b3d1285ab5ae76da6abec213fb37"
-    );
-  }
-
-  #[test]
-  fn test_data_url_media_type() {
-    let fixture = resolve_url("data:application/typescript;base64,ZXhwb3J0IGNvbnN0IGEgPSAiYSI7CgpleHBvcnQgZW51bSBBIHsKICBBLAogIEIsCiAgQywKfQo=").unwrap();
-    let actual = data_url_media_type(&fixture);
-    assert_eq!(actual, MediaType::TypeScript);
-
-    let fixture = resolve_url("data:application/javascript;base64,ZXhwb3J0IGNvbnN0IGEgPSAiYSI7CgpleHBvcnQgZW51bSBBIHsKICBBLAogIEIsCiAgQywKfQo=").unwrap();
-    let actual = data_url_media_type(&fixture);
-    assert_eq!(actual, MediaType::JavaScript);
-
-    let fixture = resolve_url("data:text/plain;base64,ZXhwb3J0IGNvbnN0IGEgPSAiYSI7CgpleHBvcnQgZW51bSBBIHsKICBBLAogIEIsCiAgQywKfQo=").unwrap();
-    let actual = data_url_media_type(&fixture);
-    assert_eq!(actual, MediaType::Unknown);
-  }
-
-  #[test]
-  fn test_lsp_url_map() {
-    let mut map = LspUrlMap::default();
-    let fixture = resolve_url("https://deno.land/x/pkg@1.0.0/mod.ts").unwrap();
-    let actual_url = map
-      .normalize_specifier(&fixture)
-      .expect("could not handle specifier");
-    let expected_url =
-      Url::parse("deno:/https/deno.land/x/pkg%401.0.0/mod.ts").unwrap();
-    assert_eq!(actual_url, expected_url);
-
-    let actual_specifier = map.normalize_url(&actual_url);
-    assert_eq!(actual_specifier, fixture);
-  }
-
-  #[test]
-  fn test_lsp_url_map_data() {
-    let mut map = LspUrlMap::default();
-    let fixture = resolve_url("data:application/typescript;base64,ZXhwb3J0IGNvbnN0IGEgPSAiYSI7CgpleHBvcnQgZW51bSBBIHsKICBBLAogIEIsCiAgQywKfQo=").unwrap();
-    let actual_url = map
-      .normalize_specifier(&fixture)
-      .expect("could not handle specifier");
-    let expected_url = Url::parse("deno:/c21c7fc382b2b0553dc0864aa81a3acacfb7b3d1285ab5ae76da6abec213fb37/data_url.ts").unwrap();
-    assert_eq!(actual_url, expected_url);
-
-    let actual_specifier = map.normalize_url(&actual_url);
-    assert_eq!(actual_specifier, fixture);
-  }
+  inner(path.as_ref())
 }

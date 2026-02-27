@@ -1,55 +1,76 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
-"use strict";
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-((window) => {
-  const core = window.Deno.core;
-  const { errors } = window.__bootstrap.errors;
+import { core, primordials } from "ext:core/mod.js";
+import { op_fs_events_open, op_fs_events_poll } from "ext:core/ops";
+const {
+  BadResourcePrototype,
+  InterruptedPrototype,
+} = core;
+const {
+  ArrayIsArray,
+  ObjectPrototypeIsPrototypeOf,
+  PromiseResolve,
+  SymbolAsyncIterator,
+  SymbolDispose,
+} = primordials;
 
-  class FsWatcher {
-    #rid = 0;
+class FsWatcher {
+  #rid = 0;
+  #promise;
 
-    constructor(paths, options) {
-      const { recursive } = options;
-      this.#rid = core.jsonOpSync("op_fs_events_open", { recursive, paths });
-    }
+  constructor(paths, options) {
+    const { recursive } = options;
+    this.#rid = op_fs_events_open(recursive, paths);
+  }
 
-    get rid() {
-      return this.#rid;
-    }
+  unref() {
+    core.unrefOpPromise(this.#promise);
+  }
 
-    async next() {
-      try {
-        return await core.jsonOpAsync("op_fs_events_poll", {
-          rid: this.rid,
-        });
-      } catch (error) {
-        if (error instanceof errors.BadResource) {
-          return { value: undefined, done: true };
-        } else if (error instanceof errors.Interrupted) {
-          return { value: undefined, done: true };
-        }
-        throw error;
+  ref() {
+    core.refOpPromise(this.#promise);
+  }
+
+  async next() {
+    try {
+      this.#promise = op_fs_events_poll(this.#rid);
+      const value = await this.#promise;
+      return value ? { value, done: false } : { value: undefined, done: true };
+    } catch (error) {
+      if (ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error)) {
+        return { value: undefined, done: true };
+      } else if (
+        ObjectPrototypeIsPrototypeOf(InterruptedPrototype, error)
+      ) {
+        return { value: undefined, done: true };
       }
-    }
-
-    return(value) {
-      core.close(this.rid);
-      return Promise.resolve({ value, done: true });
-    }
-
-    [Symbol.asyncIterator]() {
-      return this;
+      throw error;
     }
   }
 
-  function watchFs(
-    paths,
-    options = { recursive: true },
-  ) {
-    return new FsWatcher(Array.isArray(paths) ? paths : [paths], options);
+  return(value) {
+    core.close(this.#rid);
+    return PromiseResolve({ value, done: true });
   }
 
-  window.__bootstrap.fsEvents = {
-    watchFs,
-  };
-})(this);
+  close() {
+    core.close(this.#rid);
+  }
+
+  [SymbolAsyncIterator]() {
+    return this;
+  }
+
+  [SymbolDispose]() {
+    core.tryClose(this.#rid);
+  }
+}
+
+function watchFs(
+  paths,
+  options = { __proto__: null, recursive: true },
+) {
+  return new FsWatcher(ArrayIsArray(paths) ? paths : [paths], options);
+}
+
+export { watchFs };

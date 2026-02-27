@@ -1,20 +1,38 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-use deno_core::serde::Deserialize;
-use deno_core::serde::Serialize;
+use std::cmp;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
-#[derive(Debug, Deserialize, Serialize)]
+use deno_core::parking_lot::Mutex;
+use deno_core::serde::Deserialize;
+use deno_core::serde::Serialize;
+use deno_core::serde_json::json;
+
+use super::logging::lsp_debug;
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PerformanceAverage {
   pub name: String,
   pub count: u32,
   pub average_duration: u32,
+}
+
+impl PartialOrd for PerformanceAverage {
+  fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for PerformanceAverage {
+  fn cmp(&self, other: &Self) -> cmp::Ordering {
+    self.name.cmp(&other.name)
+  }
 }
 
 /// A structure which serves as a start of a measurement span.
@@ -33,6 +51,17 @@ pub struct PerformanceMeasure {
   pub duration: Duration,
 }
 
+impl fmt::Display for PerformanceMeasure {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(
+      f,
+      "{} ({}ms)",
+      self.name,
+      self.duration.as_micros() as f64 / 1000.0
+    )
+  }
+}
+
 impl From<PerformanceMark> for PerformanceMeasure {
   fn from(value: PerformanceMark) -> Self {
     Self {
@@ -43,35 +72,82 @@ impl From<PerformanceMark> for PerformanceMeasure {
   }
 }
 
+#[derive(Debug)]
+pub struct PerformanceScopeMark {
+  performance: Arc<Performance>,
+  inner: Option<PerformanceMark>,
+}
+
+impl Drop for PerformanceScopeMark {
+  fn drop(&mut self) {
+    self
+      .performance
+      .0
+      .lock()
+      .measure(self.inner.take().unwrap());
+  }
+}
+
+#[derive(Debug)]
+struct PerformanceInner {
+  counts: HashMap<String, u32>,
+  measurements_by_type: HashMap<String, (/* count */ u32, /* duration */ f64)>,
+  max_size: usize,
+  measures: VecDeque<PerformanceMeasure>,
+}
+
+impl PerformanceInner {
+  fn measure(&mut self, mark: PerformanceMark) -> Duration {
+    let measure = PerformanceMeasure::from(mark);
+    lsp_debug!(
+      "{},",
+      json!({
+        "type": "measure",
+        "name": measure.name,
+        "count": measure.count,
+        "duration": measure.duration.as_micros() as f64 / 1000.0,
+      })
+    );
+    let duration = measure.duration;
+    let measurement = self
+      .measurements_by_type
+      .entry(measure.name.to_string())
+      .or_insert((0, 0.0));
+    measurement.1 += duration.as_micros() as f64 / 1000.0;
+    self.measures.push_front(measure);
+    while self.measures.len() > self.max_size {
+      self.measures.pop_back();
+    }
+    duration
+  }
+}
+
+impl Default for PerformanceInner {
+  fn default() -> Self {
+    Self {
+      counts: Default::default(),
+      measurements_by_type: Default::default(),
+      max_size: 3_000,
+      measures: Default::default(),
+    }
+  }
+}
+
 /// A simple structure for marking a start of something to measure the duration
 /// of and measuring that duration.  Each measurement is identified by a string
 /// name and a counter is incremented each time a new measurement is marked.
 ///
 /// The structure will limit the size of measurements to the most recent 1000,
 /// and will roll off when that limit is reached.
-#[derive(Debug, Clone)]
-pub struct Performance {
-  counts: Arc<Mutex<HashMap<String, u32>>>,
-  max_size: usize,
-  measures: Arc<Mutex<VecDeque<PerformanceMeasure>>>,
-}
-
-impl Default for Performance {
-  fn default() -> Self {
-    Self {
-      counts: Default::default(),
-      max_size: 1_000,
-      measures: Default::default(),
-    }
-  }
-}
+#[derive(Debug, Default)]
+pub struct Performance(Mutex<PerformanceInner>);
 
 impl Performance {
   /// Return the count and average duration of a measurement identified by name.
   #[cfg(test)]
   pub fn average(&self, name: &str) -> Option<(usize, Duration)> {
     let mut items = Vec::new();
-    for measure in self.measures.lock().unwrap().iter() {
+    for measure in self.0.lock().measures.iter() {
       if measure.name == name {
         items.push(measure.duration);
       }
@@ -90,7 +166,7 @@ impl Performance {
   /// of each measurement.
   pub fn averages(&self) -> Vec<PerformanceAverage> {
     let mut averages: HashMap<String, Vec<Duration>> = HashMap::new();
-    for measure in self.measures.lock().unwrap().iter() {
+    for measure in self.0.lock().measures.iter() {
       averages
         .entry(measure.name.clone())
         .or_default()
@@ -99,28 +175,118 @@ impl Performance {
     averages
       .into_iter()
       .map(|(k, d)| {
-        let a = d.clone().into_iter().sum::<Duration>() / d.len() as u32;
+        let count = d.len() as u32;
+        let a = d.into_iter().sum::<Duration>() / count;
         PerformanceAverage {
           name: k,
-          count: d.len() as u32,
+          count,
           average_duration: a.as_millis() as u32,
         }
       })
       .collect()
   }
 
+  pub fn measurements_by_type(&self) -> Vec<(String, u32, f64)> {
+    self
+      .0
+      .lock()
+      .measurements_by_type
+      .iter()
+      .map(|(name, (count, duration))| (name.to_string(), *count, *duration))
+      .collect::<Vec<_>>()
+  }
+
+  pub fn averages_as_f64(&self) -> Vec<(String, u32, f64)> {
+    let mut averages: HashMap<String, Vec<Duration>> = HashMap::new();
+    for measure in self.0.lock().measures.iter() {
+      averages
+        .entry(measure.name.clone())
+        .or_default()
+        .push(measure.duration);
+    }
+    averages
+      .into_iter()
+      .map(|(k, d)| {
+        let count = d.len() as u32;
+        let a = d.into_iter().sum::<Duration>() / count;
+        (k, count, a.as_micros() as f64 / 1000.0)
+      })
+      .collect()
+  }
+
+  fn mark_inner<S: AsRef<str>, V: Serialize>(
+    &self,
+    name: S,
+    maybe_args: Option<V>,
+  ) -> PerformanceMark {
+    let mut inner = self.0.lock();
+    let name = name.as_ref();
+    let count = *inner
+      .counts
+      .entry(name.to_string())
+      .and_modify(|c| *c += 1)
+      .or_insert(1);
+    inner
+      .measurements_by_type
+      .entry(name.to_string())
+      .and_modify(|(c, _)| *c += 1)
+      .or_insert((1, 0.0));
+    let msg = if let Some(args) = maybe_args {
+      json!({
+        "type": "mark",
+        "name": name,
+        "count": count,
+        "args": args,
+      })
+    } else {
+      json!({
+        "type": "mark",
+        "name": name,
+      })
+    };
+    lsp_debug!("{},", msg);
+    PerformanceMark {
+      name: name.to_string(),
+      count,
+      start: Instant::now(),
+    }
+  }
+
   /// Marks the start of a measurement which returns a performance mark
   /// structure, which is then passed to `.measure()` to finalize the duration
   /// and add it to the internal buffer.
   pub fn mark<S: AsRef<str>>(&self, name: S) -> PerformanceMark {
-    let name = name.as_ref();
-    let mut counts = self.counts.lock().unwrap();
-    let count = counts.entry(name.to_string()).or_insert(0);
-    *count += 1;
-    PerformanceMark {
-      name: name.to_string(),
-      count: *count,
-      start: Instant::now(),
+    self.mark_inner(name, None::<()>)
+  }
+
+  /// Marks the start of a measurement which returns a performance mark
+  /// structure, which is then passed to `.measure()` to finalize the duration
+  /// and add it to the internal buffer.
+  pub fn mark_with_args<S: AsRef<str>, V: Serialize>(
+    &self,
+    name: S,
+    args: V,
+  ) -> PerformanceMark {
+    self.mark_inner(name, Some(args))
+  }
+
+  /// Creates a performance mark which will be measured against on drop. Use
+  /// like this:
+  /// ```rust
+  /// let _mark = self.performance.measure_scope("foo");
+  /// ```
+  /// Don't use like this:
+  /// ```rust
+  /// // ❌
+  /// let _ = self.performance.measure_scope("foo");
+  /// ```
+  pub fn measure_scope<S: AsRef<str>>(
+    self: &Arc<Self>,
+    name: S,
+  ) -> PerformanceScopeMark {
+    PerformanceScopeMark {
+      performance: self.clone(),
+      inner: Some(self.mark(name)),
     }
   }
 
@@ -128,14 +294,11 @@ impl Performance {
   /// be used to finalize the duration of the span being measured, and add the
   /// measurement to the internal buffer.
   pub fn measure(&self, mark: PerformanceMark) -> Duration {
-    let measure = PerformanceMeasure::from(mark);
-    let duration = measure.duration;
-    let mut measures = self.measures.lock().unwrap();
-    measures.push_back(measure);
-    while measures.len() > self.max_size {
-      measures.pop_front();
-    }
-    duration
+    self.0.lock().measure(mark)
+  }
+
+  pub fn to_vec(&self) -> Vec<PerformanceMeasure> {
+    self.0.lock().measures.iter().cloned().collect()
   }
 }
 

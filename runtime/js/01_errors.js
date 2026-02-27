@@ -1,163 +1,189 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
-"use strict";
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-((window) => {
-  class NotFound extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "NotFound";
-    }
+import { core, primordials } from "ext:core/mod.js";
+const { BadResource, Interrupted, NotCapable } = core;
+const { Error } = primordials;
+
+class NotFound extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "NotFound";
   }
+}
 
-  class PermissionDenied extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "PermissionDenied";
-    }
+class ConnectionRefused extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "ConnectionRefused";
   }
+}
 
-  class ConnectionRefused extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "ConnectionRefused";
-    }
+class ConnectionReset extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "ConnectionReset";
   }
+}
 
-  class ConnectionReset extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "ConnectionReset";
-    }
+class ConnectionAborted extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "ConnectionAborted";
   }
+}
 
-  class ConnectionAborted extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "ConnectionAborted";
-    }
+class NotConnected extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "NotConnected";
   }
+}
 
-  class NotConnected extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "NotConnected";
-    }
+class AddrInUse extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "AddrInUse";
   }
+}
 
-  class AddrInUse extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "AddrInUse";
-    }
+class AddrNotAvailable extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "AddrNotAvailable";
   }
+}
 
-  class AddrNotAvailable extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "AddrNotAvailable";
-    }
+class BrokenPipe extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "BrokenPipe";
   }
+}
 
-  class BrokenPipe extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "BrokenPipe";
-    }
+class AlreadyExists extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "AlreadyExists";
   }
+}
 
-  class AlreadyExists extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "AlreadyExists";
-    }
+class InvalidData extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "InvalidData";
   }
+}
 
-  class InvalidData extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "InvalidData";
-    }
+class TimedOut extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "TimedOut";
   }
+}
 
-  class TimedOut extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "TimedOut";
-    }
+class WriteZero extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "WriteZero";
   }
+}
 
-  class Interrupted extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "Interrupted";
-    }
+class WouldBlock extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "WouldBlock";
   }
+}
 
-  class WriteZero extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "WriteZero";
-    }
+class UnexpectedEof extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "UnexpectedEof";
   }
+}
 
-  class UnexpectedEof extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "UnexpectedEof";
-    }
+class Http extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "Http";
   }
+}
 
-  class BadResource extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "BadResource";
-    }
+class Busy extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "Busy";
   }
+}
 
-  class Http extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "Http";
-    }
+class PermissionDenied extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "PermissionDenied";
   }
+}
 
-  class Busy extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "Busy";
-    }
+class NotSupported extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "NotSupported";
   }
+}
 
-  class NotSupported extends Error {
-    constructor(msg) {
-      super(msg);
-      this.name = "NotSupported";
-    }
+class FilesystemLoop extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "FilesystemLoop";
   }
+}
 
-  const errors = {
-    NotFound,
-    PermissionDenied,
-    ConnectionRefused,
-    ConnectionReset,
-    ConnectionAborted,
-    NotConnected,
-    AddrInUse,
-    AddrNotAvailable,
-    BrokenPipe,
-    AlreadyExists,
-    InvalidData,
-    TimedOut,
-    Interrupted,
-    WriteZero,
-    UnexpectedEof,
-    BadResource,
-    Http,
-    Busy,
-    NotSupported,
-  };
+class IsADirectory extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "IsADirectory";
+  }
+}
 
-  window.__bootstrap.errors = {
-    errors,
-  };
-})(this);
+class NetworkUnreachable extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "NetworkUnreachable";
+  }
+}
+
+class NotADirectory extends Error {
+  constructor(msg, opts) {
+    super(msg, opts);
+    this.name = "NotADirectory";
+  }
+}
+
+const errors = {
+  NotFound,
+  PermissionDenied,
+  ConnectionRefused,
+  ConnectionReset,
+  ConnectionAborted,
+  NotConnected,
+  AddrInUse,
+  AddrNotAvailable,
+  BrokenPipe,
+  AlreadyExists,
+  InvalidData,
+  TimedOut,
+  Interrupted,
+  WriteZero,
+  WouldBlock,
+  UnexpectedEof,
+  BadResource,
+  Http,
+  Busy,
+  NotSupported,
+  FilesystemLoop,
+  IsADirectory,
+  NetworkUnreachable,
+  NotADirectory,
+  NotCapable,
+};
+
+export { errors };

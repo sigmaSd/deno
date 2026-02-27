@@ -2,8 +2,13 @@
   "rules": {
     "tags": ["recommended"],
     "include": [
-      "ban-untagged-todo"
+      "ban-untagged-todo",
+      "camelcase",
+      "no-console",
+      "guard-for-in"
     ],
-    "exclude": []
+    "exclude": [
+      "no-invalid-triple-slash-reference"
+    ]
   }
 }

@@ -1,368 +1,157 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-use crate::permissions::resolve_read_allowlist;
-use crate::permissions::resolve_write_allowlist;
-use crate::permissions::NetDescriptor;
-use crate::permissions::PermissionState;
-use crate::permissions::Permissions;
-use crate::permissions::ReadDescriptor;
-use crate::permissions::UnaryPermission;
-use crate::permissions::UnitPermission;
-use crate::permissions::WriteDescriptor;
-use crate::web_worker::run_web_worker;
-use crate::web_worker::WebWorker;
-use crate::web_worker::WebWorkerHandle;
-use crate::web_worker::WorkerEvent;
-use deno_core::error::custom_error;
-use deno_core::error::generic_error;
-use deno_core::error::AnyError;
-use deno_core::error::JsError;
-use deno_core::futures::channel::mpsc;
-use deno_core::serde::de;
-use deno_core::serde::de::SeqAccess;
-use deno_core::serde::Deserialize;
-use deno_core::serde::Deserializer;
-use deno_core::serde_json::json;
-use deno_core::serde_json::Value;
-use deno_core::BufVec;
-use deno_core::ModuleSpecifier;
-use deno_core::OpState;
-use deno_core::ZeroCopyBuf;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::convert::From;
-use std::fmt;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+use deno_core::CancelFuture;
+use deno_core::CancelHandle;
+use deno_core::ModuleSpecifier;
+use deno_core::OpState;
+use deno_core::op2;
+use deno_core::serde::Deserialize;
+use deno_permissions::ChildPermissionsArg;
+use deno_permissions::PermissionsContainer;
+use deno_web::JsMessageData;
+use deno_web::MessagePortError;
+use deno_web::deserialize_js_transferables;
+use log::debug;
+
+use crate::ops::TestingFeaturesEnabled;
+use crate::tokio_util::create_and_run_current_thread;
+use crate::web_worker::SendableWebWorkerHandle;
+use crate::web_worker::WebWorker;
+use crate::web_worker::WebWorkerHandle;
+use crate::web_worker::WorkerControlEvent;
+use crate::web_worker::WorkerId;
+use crate::web_worker::WorkerMetadata;
+use crate::web_worker::WorkerThreadType;
+use crate::web_worker::run_web_worker;
+use crate::worker::FormatJsErrorFn;
+
+pub const UNSTABLE_FEATURE_NAME: &str = "worker-options";
 
 pub struct CreateWebWorkerArgs {
   pub name: String,
-  pub worker_id: u32,
-  pub parent_permissions: Permissions,
-  pub permissions: Permissions,
+  pub worker_id: WorkerId,
+  pub parent_permissions: PermissionsContainer,
+  pub permissions: PermissionsContainer,
   pub main_module: ModuleSpecifier,
-  pub use_deno_namespace: bool,
+  pub worker_type: WorkerThreadType,
+  pub close_on_idle: bool,
+  pub maybe_worker_metadata: Option<WorkerMetadata>,
 }
 
-pub type CreateWebWorkerCb =
-  dyn Fn(CreateWebWorkerArgs) -> WebWorker + Sync + Send;
+pub type CreateWebWorkerCb = dyn Fn(CreateWebWorkerArgs) -> (WebWorker, SendableWebWorkerHandle)
+  + Sync
+  + Send;
 
 /// A holder for callback that is used to create a new
 /// WebWorker. It's a struct instead of a type alias
 /// because `GothamState` used in `OpState` overrides
-/// value if type alises have the same underlying type
+/// value if type aliases have the same underlying type
 #[derive(Clone)]
-pub struct CreateWebWorkerCbHolder(Arc<CreateWebWorkerCb>);
+struct CreateWebWorkerCbHolder(Arc<CreateWebWorkerCb>);
 
-#[derive(Deserialize)]
-struct HostUnhandledErrorArgs {
-  message: String,
-}
+#[derive(Clone)]
+struct FormatJsErrorFnHolder(Option<Arc<FormatJsErrorFn>>);
 
 pub struct WorkerThread {
-  join_handle: JoinHandle<Result<(), AnyError>>,
   worker_handle: WebWorkerHandle,
+  cancel_handle: Rc<CancelHandle>,
+  cpu_thread_handle: Arc<AtomicU64>,
+
+  // A WorkerThread that hasn't been explicitly terminated can only be removed
+  // from the WorkersTable once close messages have been received for both the
+  // control and message channels. See `close_channel`.
+  ctrl_closed: bool,
+  message_closed: bool,
 }
 
-pub type WorkersTable = HashMap<u32, WorkerThread>;
-pub type WorkerId = u32;
-
-pub fn init(
-  rt: &mut deno_core::JsRuntime,
-  sender: Option<mpsc::Sender<WorkerEvent>>,
-  create_web_worker_cb: Arc<CreateWebWorkerCb>,
-) {
-  {
-    let op_state = rt.op_state();
-    let mut state = op_state.borrow_mut();
-    state.put::<WorkersTable>(WorkersTable::default());
-    state.put::<WorkerId>(WorkerId::default());
-
-    let create_module_loader = CreateWebWorkerCbHolder(create_web_worker_cb);
-    state.put::<CreateWebWorkerCbHolder>(create_module_loader);
+impl WorkerThread {
+  fn terminate(self) {
+    // Cancel recv ops when terminating the worker, so they don't show up as
+    // pending ops.
+    self.cancel_handle.cancel();
   }
-  super::reg_json_sync(rt, "op_create_worker", op_create_worker);
-  super::reg_json_sync(
-    rt,
-    "op_host_terminate_worker",
+}
+
+impl Drop for WorkerThread {
+  fn drop(&mut self) {
+    self.worker_handle.clone().terminate();
+  }
+}
+
+pub type WorkersTable = HashMap<WorkerId, WorkerThread>;
+
+deno_core::extension!(
+  deno_worker_host,
+  ops = [
+    op_create_worker,
     op_host_terminate_worker,
-  );
-  super::reg_json_sync(rt, "op_host_post_message", op_host_post_message);
-  super::reg_json_async(rt, "op_host_get_message", op_host_get_message);
-  super::reg_json_sync(
-    rt,
-    "op_host_unhandled_error",
-    move |_state, args: HostUnhandledErrorArgs, _zero_copy| {
-      if let Some(mut sender) = sender.clone() {
-        sender
-          .try_send(WorkerEvent::Error(generic_error(args.message)))
-          .expect("Failed to propagate error event to parent worker");
-        Ok(json!(true))
-      } else {
-        Err(generic_error("Cannot be called from main worker."))
-      }
-    },
-  );
-}
+    op_host_post_message,
+    op_host_recv_ctrl,
+    op_host_recv_message,
+    op_host_get_worker_cpu_usage,
+  ],
+  options = {
+    create_web_worker_cb: Arc<CreateWebWorkerCb>,
+    format_js_error_fn: Option<Arc<FormatJsErrorFn>>,
+  },
+  state = |state, options| {
+    state.put::<WorkersTable>(WorkersTable::default());
 
-fn merge_boolean_permission(
-  mut main: UnitPermission,
-  worker: Option<PermissionState>,
-) -> Result<UnitPermission, AnyError> {
-  if let Some(worker) = worker {
-    if worker < main.state {
-      return Err(custom_error(
-        "PermissionDenied",
-        "Can't escalate parent thread permissions",
-      ));
-    } else {
-      main.state = worker;
-    }
-  }
-  Ok(main)
-}
-
-fn merge_net_permission(
-  mut main: UnaryPermission<NetDescriptor>,
-  worker: Option<UnaryPermission<NetDescriptor>>,
-) -> Result<UnaryPermission<NetDescriptor>, AnyError> {
-  if let Some(worker) = worker {
-    if (worker.global_state < main.global_state)
-      || !worker
-        .granted_list
-        .iter()
-        .all(|x| main.check(&(&x.0, x.1)).is_ok())
-    {
-      return Err(custom_error(
-        "PermissionDenied",
-        "Can't escalate parent thread permissions",
-      ));
-    } else {
-      main.global_state = worker.global_state;
-      main.granted_list = worker.granted_list;
-    }
-  }
-  Ok(main)
-}
-
-fn merge_read_permission(
-  mut main: UnaryPermission<ReadDescriptor>,
-  worker: Option<UnaryPermission<ReadDescriptor>>,
-) -> Result<UnaryPermission<ReadDescriptor>, AnyError> {
-  if let Some(worker) = worker {
-    if (worker.global_state < main.global_state)
-      || !worker
-        .granted_list
-        .iter()
-        .all(|x| main.check(x.0.as_path()).is_ok())
-    {
-      return Err(custom_error(
-        "PermissionDenied",
-        "Can't escalate parent thread permissions",
-      ));
-    } else {
-      main.global_state = worker.global_state;
-      main.granted_list = worker.granted_list;
-    }
-  }
-  Ok(main)
-}
-
-fn merge_write_permission(
-  mut main: UnaryPermission<WriteDescriptor>,
-  worker: Option<UnaryPermission<WriteDescriptor>>,
-) -> Result<UnaryPermission<WriteDescriptor>, AnyError> {
-  if let Some(worker) = worker {
-    if (worker.global_state < main.global_state)
-      || !worker
-        .granted_list
-        .iter()
-        .all(|x| main.check(x.0.as_path()).is_ok())
-    {
-      return Err(custom_error(
-        "PermissionDenied",
-        "Can't escalate parent thread permissions",
-      ));
-    } else {
-      main.global_state = worker.global_state;
-      main.granted_list = worker.granted_list;
-    }
-  }
-  Ok(main)
-}
-
-fn create_worker_permissions(
-  main_perms: Permissions,
-  worker_perms: PermissionsArg,
-) -> Result<Permissions, AnyError> {
-  Ok(Permissions {
-    env: merge_boolean_permission(main_perms.env, worker_perms.env)?,
-    hrtime: merge_boolean_permission(main_perms.hrtime, worker_perms.hrtime)?,
-    net: merge_net_permission(main_perms.net, worker_perms.net)?,
-    plugin: merge_boolean_permission(main_perms.plugin, worker_perms.plugin)?,
-    read: merge_read_permission(main_perms.read, worker_perms.read)?,
-    run: merge_boolean_permission(main_perms.run, worker_perms.run)?,
-    write: merge_write_permission(main_perms.write, worker_perms.write)?,
-  })
-}
-
-#[derive(Debug, Deserialize)]
-struct PermissionsArg {
-  #[serde(default, deserialize_with = "as_permission_state")]
-  env: Option<PermissionState>,
-  #[serde(default, deserialize_with = "as_permission_state")]
-  hrtime: Option<PermissionState>,
-  #[serde(default, deserialize_with = "as_unary_net_permission")]
-  net: Option<UnaryPermission<NetDescriptor>>,
-  #[serde(default, deserialize_with = "as_permission_state")]
-  plugin: Option<PermissionState>,
-  #[serde(default, deserialize_with = "as_unary_read_permission")]
-  read: Option<UnaryPermission<ReadDescriptor>>,
-  #[serde(default, deserialize_with = "as_permission_state")]
-  run: Option<PermissionState>,
-  #[serde(default, deserialize_with = "as_unary_write_permission")]
-  write: Option<UnaryPermission<WriteDescriptor>>,
-}
-
-fn as_permission_state<'de, D>(
-  deserializer: D,
-) -> Result<Option<PermissionState>, D::Error>
-where
-  D: Deserializer<'de>,
-{
-  let value: bool = Deserialize::deserialize(deserializer)?;
-
-  match value {
-    true => Ok(Some(PermissionState::Granted)),
-    false => Ok(Some(PermissionState::Denied)),
-  }
-}
-
-struct UnaryPermissionBase {
-  global_state: PermissionState,
-  paths: Vec<String>,
-}
-
-struct ParseBooleanOrStringVec;
-
-impl<'de> de::Visitor<'de> for ParseBooleanOrStringVec {
-  type Value = UnaryPermissionBase;
-
-  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-    formatter.write_str("a vector of strings or a boolean")
-  }
-
-  fn visit_bool<E>(self, v: bool) -> Result<UnaryPermissionBase, E>
-  where
-    E: de::Error,
-  {
-    Ok(UnaryPermissionBase {
-      global_state: match v {
-        true => PermissionState::Granted,
-        false => PermissionState::Denied,
-      },
-      paths: Vec::new(),
-    })
-  }
-
-  fn visit_seq<V>(self, mut visitor: V) -> Result<UnaryPermissionBase, V::Error>
-  where
-    V: SeqAccess<'de>,
-  {
-    let mut vec: Vec<String> = Vec::new();
-
-    let mut value = visitor.next_element::<String>()?;
-    while value.is_some() {
-      vec.push(value.unwrap());
-      value = visitor.next_element()?;
-    }
-    Ok(UnaryPermissionBase {
-      global_state: PermissionState::Prompt,
-      paths: vec,
-    })
-  }
-}
-
-fn as_unary_net_permission<'de, D>(
-  deserializer: D,
-) -> Result<Option<UnaryPermission<NetDescriptor>>, D::Error>
-where
-  D: Deserializer<'de>,
-{
-  let value: UnaryPermissionBase =
-    deserializer.deserialize_any(ParseBooleanOrStringVec)?;
-
-  let allowed: HashSet<NetDescriptor> = value
-    .paths
-    .into_iter()
-    .map(NetDescriptor::from_string)
-    .collect();
-
-  Ok(Some(UnaryPermission::<NetDescriptor> {
-    global_state: value.global_state,
-    granted_list: allowed,
-    ..Default::default()
-  }))
-}
-
-fn as_unary_read_permission<'de, D>(
-  deserializer: D,
-) -> Result<Option<UnaryPermission<ReadDescriptor>>, D::Error>
-where
-  D: Deserializer<'de>,
-{
-  let value: UnaryPermissionBase =
-    deserializer.deserialize_any(ParseBooleanOrStringVec)?;
-
-  let paths: Vec<PathBuf> =
-    value.paths.into_iter().map(PathBuf::from).collect();
-
-  Ok(Some(UnaryPermission::<ReadDescriptor> {
-    global_state: value.global_state,
-    granted_list: resolve_read_allowlist(&Some(paths)),
-    ..Default::default()
-  }))
-}
-
-fn as_unary_write_permission<'de, D>(
-  deserializer: D,
-) -> Result<Option<UnaryPermission<WriteDescriptor>>, D::Error>
-where
-  D: Deserializer<'de>,
-{
-  let value: UnaryPermissionBase =
-    deserializer.deserialize_any(ParseBooleanOrStringVec)?;
-
-  let paths: Vec<PathBuf> =
-    value.paths.into_iter().map(PathBuf::from).collect();
-
-  Ok(Some(UnaryPermission::<WriteDescriptor> {
-    global_state: value.global_state,
-    granted_list: resolve_write_allowlist(&Some(paths)),
-    ..Default::default()
-  }))
-}
+    let create_web_worker_cb_holder =
+      CreateWebWorkerCbHolder(options.create_web_worker_cb);
+    state.put::<CreateWebWorkerCbHolder>(create_web_worker_cb_holder);
+    let format_js_error_fn_holder =
+      FormatJsErrorFnHolder(options.format_js_error_fn);
+    state.put::<FormatJsErrorFnHolder>(format_js_error_fn_holder);
+  },
+);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkerArgs {
   has_source_code: bool,
   name: Option<String>,
-  permissions: Option<PermissionsArg>,
+  permissions: Option<ChildPermissionsArg>,
   source_code: String,
   specifier: String,
-  use_deno_namespace: bool,
+  worker_type: WorkerThreadType,
+  close_on_idle: bool,
+}
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum CreateWorkerError {
+  #[class("DOMExceptionNotSupportedError")]
+  #[error("Classic workers are not supported.")]
+  ClassicWorkers,
+  #[class(inherit)]
+  #[error(transparent)]
+  Permission(deno_permissions::ChildPermissionError),
+  #[class(inherit)]
+  #[error(transparent)]
+  ModuleResolution(#[from] deno_core::ModuleResolutionError),
+  #[class(inherit)]
+  #[error(transparent)]
+  MessagePort(#[from] MessagePortError),
+  #[class(inherit)]
+  #[error("{0}")]
+  Io(#[from] std::io::Error),
 }
 
 /// Create worker as the host
+#[op2(stack_trace)]
+#[serde]
 fn op_create_worker(
   state: &mut OpState,
-  args: CreateWorkerArgs,
-  _data: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
+  #[serde] args: CreateWorkerArgs,
+  #[serde] maybe_worker_metadata: Option<JsMessageData>,
+) -> Result<WorkerId, CreateWorkerError> {
   let specifier = args.specifier.clone();
   let maybe_source_code = if args.has_source_code {
     Some(args.source_code.clone())
@@ -370,65 +159,108 @@ fn op_create_worker(
     None
   };
   let args_name = args.name;
-  let use_deno_namespace = args.use_deno_namespace;
-  if use_deno_namespace {
-    super::check_unstable(state, "Worker.deno.namespace");
+  let worker_type = args.worker_type;
+  if let WorkerThreadType::Classic = worker_type
+    && let TestingFeaturesEnabled(false) = state.borrow()
+  {
+    return Err(CreateWorkerError::ClassicWorkers);
   }
-  let parent_permissions = state.borrow::<Permissions>().clone();
-  let worker_permissions = if let Some(permissions) = args.permissions {
-    super::check_unstable(state, "Worker.deno.permissions");
-    create_worker_permissions(parent_permissions.clone(), permissions)?
+
+  if args.permissions.is_some() {
+    super::check_unstable(
+      state,
+      UNSTABLE_FEATURE_NAME,
+      "Worker.deno.permissions",
+    );
+  }
+
+  let parent_permissions = state.borrow_mut::<PermissionsContainer>();
+  let worker_permissions = if let Some(child_permissions_arg) = args.permissions
+  {
+    parent_permissions
+      .create_child_permissions(child_permissions_arg)
+      .map_err(CreateWorkerError::Permission)?
   } else {
     parent_permissions.clone()
   };
-
-  let worker_id = state.take::<WorkerId>();
-  let create_module_loader = state.take::<CreateWebWorkerCbHolder>();
-  state.put::<CreateWebWorkerCbHolder>(create_module_loader.clone());
-  state.put::<WorkerId>(worker_id + 1);
+  let parent_permissions = parent_permissions.clone();
+  let create_web_worker_cb = state.borrow::<CreateWebWorkerCbHolder>().clone();
+  let format_js_error_fn = state.borrow::<FormatJsErrorFnHolder>().clone();
+  let worker_id = WorkerId::new();
 
   let module_specifier = deno_core::resolve_url(&specifier)?;
-  let worker_name = args_name.unwrap_or_else(|| "".to_string());
+  let worker_name = args_name.unwrap_or_default();
 
   let (handle_sender, handle_receiver) =
-    std::sync::mpsc::sync_channel::<Result<WebWorkerHandle, AnyError>>(1);
+    std::sync::mpsc::sync_channel::<SendableWebWorkerHandle>(1);
 
   // Setup new thread
-  let thread_builder =
-    std::thread::Builder::new().name(format!("deno-worker-{}", worker_id));
+  let thread_builder = std::thread::Builder::new().name(format!("{worker_id}"));
+  let maybe_worker_metadata = if let Some(data) = maybe_worker_metadata {
+    let transferables =
+      deserialize_js_transferables(state, data.transferables)?;
+    Some(WorkerMetadata {
+      buffer: data.data,
+      transferables,
+    })
+  } else {
+    None
+  };
+  let cpu_thread_handle = Arc::new(AtomicU64::new(0));
+  let cpu_thread_handle_writer = cpu_thread_handle.clone();
 
   // Spawn it
-  let join_handle = thread_builder.spawn(move || {
+  thread_builder.spawn(move || {
+    // Capture the OS thread handle for CPU usage queries from the host.
+    cpu_thread_handle_writer
+      .store(capture_current_thread_handle(), Ordering::Release);
+
     // Any error inside this block is terminal:
     // - JS worker is useless - meaning it throws an exception and can't do anything else,
     //  all action done upon it should be noops
     // - newly spawned thread exits
+    let fut = async move {
+      let (worker, external_handle) =
+        (create_web_worker_cb.0)(CreateWebWorkerArgs {
+          name: worker_name,
+          worker_id,
+          parent_permissions,
+          permissions: worker_permissions,
+          main_module: module_specifier.clone(),
+          worker_type,
+          close_on_idle: args.close_on_idle,
+          maybe_worker_metadata,
+        });
 
-    let worker = (create_module_loader.0)(CreateWebWorkerArgs {
-      name: worker_name,
-      worker_id,
-      parent_permissions,
-      permissions: worker_permissions,
-      main_module: module_specifier.clone(),
-      use_deno_namespace,
-    });
+      // Send thread safe handle from newly created worker to host thread
+      handle_sender.send(external_handle).unwrap();
+      drop(handle_sender);
 
-    // Send thread safe handle to newly created worker to host thread
-    handle_sender.send(Ok(worker.thread_safe_handle())).unwrap();
-    drop(handle_sender);
+      // At this point the only method of communication with host
+      // is using `worker.internal_channels`.
+      //
+      // Host can already push messages and interact with worker.
+      run_web_worker(
+        worker,
+        module_specifier,
+        maybe_source_code,
+        format_js_error_fn.0,
+      )
+      .await
+    };
 
-    // At this point the only method of communication with host
-    // is using `worker.internal_channels`.
-    //
-    // Host can already push messages and interact with worker.
-    run_web_worker(worker, module_specifier, maybe_source_code)
+    create_and_run_current_thread(fut)
   })?;
 
-  let worker_handle = handle_receiver.recv().unwrap()?;
+  // Receive WebWorkerHandle from newly created worker
+  let worker_handle = handle_receiver.recv().unwrap();
 
   let worker_thread = WorkerThread {
-    join_handle,
-    worker_handle,
+    worker_handle: worker_handle.into(),
+    cancel_handle: CancelHandle::new_rc(),
+    cpu_thread_handle,
+    ctrl_closed: false,
+    message_closed: false,
   };
 
   // At this point all interactions with worker happen using thread
@@ -437,139 +269,345 @@ fn op_create_worker(
     .borrow_mut::<WorkersTable>()
     .insert(worker_id, worker_thread);
 
-  Ok(json!({ "id": worker_id }))
+  Ok(worker_id)
 }
 
-#[derive(Deserialize)]
-pub struct WorkerArgs {
-  id: i32,
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn op_host_terminate_worker(
-  state: &mut OpState,
-  args: WorkerArgs,
-  _data: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  let id = args.id as u32;
-  let worker_thread = state
-    .borrow_mut::<WorkersTable>()
-    .remove(&id)
-    .expect("No worker handle found");
-  worker_thread.worker_handle.terminate();
-  worker_thread
-    .join_handle
-    .join()
-    .expect("Panic in worker thread")
-    .expect("Panic in worker event loop");
-  Ok(json!({}))
-}
-
-fn serialize_worker_event(event: WorkerEvent) -> Value {
-  match event {
-    WorkerEvent::Message(buf) => json!({ "type": "msg", "data": buf }),
-    WorkerEvent::TerminalError(error) => match error.downcast::<JsError>() {
-      Ok(js_error) => json!({
-        "type": "terminalError",
-        "error": {
-          "message": js_error.message,
-          "fileName": js_error.script_resource_name,
-          "lineNumber": js_error.line_number,
-          "columnNumber": js_error.start_column,
-        }
-      }),
-      Err(error) => json!({
-        "type": "terminalError",
-        "error": {
-          "message": error.to_string(),
-        }
-      }),
-    },
-    WorkerEvent::Error(error) => match error.downcast::<JsError>() {
-      Ok(js_error) => json!({
-        "type": "error",
-        "error": {
-          "message": js_error.message,
-          "fileName": js_error.script_resource_name,
-          "lineNumber": js_error.line_number,
-          "columnNumber": js_error.start_column,
-        }
-      }),
-      Err(error) => json!({
-        "type": "error",
-        "error": {
-          "message": error.to_string(),
-        }
-      }),
-    },
+#[op2]
+fn op_host_terminate_worker(state: &mut OpState, #[serde] id: WorkerId) {
+  match state.borrow_mut::<WorkersTable>().remove(&id) {
+    Some(worker_thread) => {
+      worker_thread.terminate();
+    }
+    _ => {
+      debug!("tried to terminate non-existent worker {}", id);
+    }
   }
 }
 
-/// Try to remove worker from workers table - NOTE: `Worker.terminate()`
-/// might have been called already meaning that we won't find worker in
-/// table - in that case ignore.
-fn try_remove_and_close(state: Rc<RefCell<OpState>>, id: u32) {
+enum WorkerChannel {
+  Ctrl,
+  Messages,
+}
+
+/// Close a worker's channel. If this results in both of a worker's channels
+/// being closed, the worker will be removed from the workers table.
+fn close_channel(
+  state: Rc<RefCell<OpState>>,
+  id: WorkerId,
+  channel: WorkerChannel,
+) {
+  use std::collections::hash_map::Entry;
+
   let mut s = state.borrow_mut();
   let workers = s.borrow_mut::<WorkersTable>();
-  if let Some(mut worker_thread) = workers.remove(&id) {
-    worker_thread.worker_handle.sender.close_channel();
-    worker_thread
-      .join_handle
-      .join()
-      .expect("Worker thread panicked")
-      .expect("Panic in worker event loop");
+
+  // `Worker.terminate()` might have been called already, meaning that we won't
+  // find the worker in the table - in that case ignore.
+  if let Entry::Occupied(mut entry) = workers.entry(id) {
+    let terminate = {
+      let worker_thread = entry.get_mut();
+      match channel {
+        WorkerChannel::Ctrl => {
+          worker_thread.ctrl_closed = true;
+          worker_thread.message_closed
+        }
+        WorkerChannel::Messages => {
+          worker_thread.message_closed = true;
+          worker_thread.ctrl_closed
+        }
+      }
+    };
+
+    if terminate {
+      entry.remove().terminate();
+    }
   }
 }
 
-/// Get message from guest worker as host
-async fn op_host_get_message(
+/// Get control event from guest worker as host
+#[op2]
+#[serde]
+async fn op_host_recv_ctrl(
   state: Rc<RefCell<OpState>>,
-  args: WorkerArgs,
-  _zero_copy: BufVec,
-) -> Result<Value, AnyError> {
-  let id = args.id as u32;
+  #[serde] id: WorkerId,
+) -> WorkerControlEvent {
+  let (worker_handle, cancel_handle) = {
+    let state = state.borrow();
+    let workers_table = state.borrow::<WorkersTable>();
+    let maybe_handle = workers_table.get(&id);
+    if let Some(handle) = maybe_handle {
+      (handle.worker_handle.clone(), handle.cancel_handle.clone())
+    } else {
+      // If handle was not found it means worker has already shutdown
+      return WorkerControlEvent::Close(0);
+    }
+  };
 
-  let worker_handle = {
+  let maybe_event = worker_handle
+    .get_control_event()
+    .or_cancel(cancel_handle)
+    .await;
+  match maybe_event {
+    Ok(Some(event)) => {
+      // Terminal error or close means that worker should be removed from worker table.
+      match &event {
+        WorkerControlEvent::TerminalError(..)
+        | WorkerControlEvent::Close(_) => {
+          close_channel(state, id, WorkerChannel::Ctrl);
+        }
+      }
+      event
+    }
+    Ok(None) => {
+      // If there was no event from worker it means it has already been closed.
+      close_channel(state, id, WorkerChannel::Ctrl);
+      WorkerControlEvent::Close(0)
+    }
+    Err(_) => {
+      // The worker was terminated.
+      WorkerControlEvent::Close(0)
+    }
+  }
+}
+
+#[op2]
+#[serde]
+async fn op_host_recv_message(
+  state: Rc<RefCell<OpState>>,
+  #[serde] id: WorkerId,
+) -> Result<Option<JsMessageData>, MessagePortError> {
+  let (worker_handle, cancel_handle) = {
     let s = state.borrow();
     let workers_table = s.borrow::<WorkersTable>();
     let maybe_handle = workers_table.get(&id);
     if let Some(handle) = maybe_handle {
-      handle.worker_handle.clone()
+      (handle.worker_handle.clone(), handle.cancel_handle.clone())
     } else {
       // If handle was not found it means worker has already shutdown
-      return Ok(json!({ "type": "close" }));
+      return Ok(None);
     }
   };
 
-  let maybe_event = worker_handle.get_event().await?;
-  if let Some(event) = maybe_event {
-    // Terminal error means that worker should be removed from worker table.
-    if let WorkerEvent::TerminalError(_) = &event {
-      try_remove_and_close(state, id);
+  let ret = worker_handle
+    .port
+    .recv(state.clone())
+    .or_cancel(cancel_handle)
+    .await;
+  match ret {
+    Ok(Ok(ret)) => {
+      if ret.is_none() {
+        close_channel(state, id, WorkerChannel::Messages);
+      }
+      Ok(ret)
     }
-    return Ok(serialize_worker_event(event));
+    Ok(Err(err)) => Err(err),
+    Err(_) => {
+      // The worker was terminated.
+      Ok(None)
+    }
   }
-
-  // If there was no event from worker it means it has already been closed.
-  try_remove_and_close(state, id);
-  Ok(json!({ "type": "close" }))
 }
 
 /// Post message to guest worker as host
+#[op2]
 fn op_host_post_message(
   state: &mut OpState,
-  args: WorkerArgs,
-  data: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  assert_eq!(data.len(), 1, "Invalid number of arguments");
-  let id = args.id as u32;
-  let msg = Vec::from(&*data[0]).into_boxed_slice();
+  #[serde] id: WorkerId,
+  #[serde] data: JsMessageData,
+) -> Result<(), MessagePortError> {
+  if let Some(worker_thread) = state.borrow::<WorkersTable>().get(&id) {
+    debug!("post message to worker {}", id);
+    let worker_handle = worker_thread.worker_handle.clone();
+    worker_handle.port.send(state, data)?;
+  } else {
+    debug!("tried to post message to non-existent worker {}", id);
+  }
+  Ok(())
+}
 
-  debug!("post message to worker {}", id);
-  let worker_thread = state
-    .borrow::<WorkersTable>()
-    .get(&id)
-    .expect("No worker handle found");
-  worker_thread.worker_handle.post_message(msg)?;
-  Ok(json!({}))
+#[op2]
+fn op_host_get_worker_cpu_usage(
+  state: &mut OpState,
+  #[serde] id: WorkerId,
+  #[buffer] out: &mut [f64],
+) {
+  if let Some(worker_thread) = state.borrow::<WorkersTable>().get(&id) {
+    let handle = worker_thread.cpu_thread_handle.load(Ordering::Acquire);
+    if handle != 0 {
+      let (user, system) = get_thread_cpu_usage_by_handle(handle);
+      out[0] = user;
+      out[1] = system;
+      return;
+    }
+  }
+  out[0] = 0.0;
+  out[1] = 0.0;
+}
+
+#[cfg(target_os = "macos")]
+fn capture_current_thread_handle() -> u64 {
+  // SAFETY: FFI call to get the current thread's Mach port.
+  unsafe { mach_thread_self() as u64 }
+}
+
+#[cfg(target_os = "macos")]
+fn get_thread_cpu_usage_by_handle(handle: u64) -> (f64, f64) {
+  let thread_port = handle as u32;
+  // SAFETY: thread_info() will initialize this
+  let mut info: ThreadBasicInfo = unsafe { std::mem::zeroed() };
+  let mut count: u32 = THREAD_BASIC_INFO_COUNT;
+
+  // SAFETY: FFI call to query thread CPU times
+  let kr = unsafe {
+    thread_info(
+      thread_port,
+      THREAD_BASIC_INFO,
+      (&raw mut info) as *mut i32,
+      &mut count,
+    )
+  };
+
+  if kr != 0 {
+    return (0.0, 0.0);
+  }
+
+  let user =
+    info.user_time_seconds as f64 * 1e6 + info.user_time_microseconds as f64;
+  let system = info.system_time_seconds as f64 * 1e6
+    + info.system_time_microseconds as f64;
+  (user, system)
+}
+
+#[cfg(target_os = "macos")]
+const THREAD_BASIC_INFO: u32 = 3;
+#[cfg(target_os = "macos")]
+const THREAD_BASIC_INFO_COUNT: u32 = 10;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ThreadBasicInfo {
+  user_time_seconds: i32,
+  user_time_microseconds: i32,
+  system_time_seconds: i32,
+  system_time_microseconds: i32,
+  cpu_usage: i32,
+  policy: i32,
+  run_state: i32,
+  flags: i32,
+  suspend_count: i32,
+  sleep_time: i32,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+  fn mach_thread_self() -> u32;
+  fn thread_info(
+    target_act: u32,
+    flavor: u32,
+    thread_info_out: *mut i32,
+    thread_info_outCnt: *mut u32,
+  ) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn capture_current_thread_handle() -> u64 {
+  // SAFETY: syscall to get the current thread ID.
+  unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+#[cfg(target_os = "linux")]
+fn get_thread_cpu_usage_by_handle(handle: u64) -> (f64, f64) {
+  let tid = handle as i32;
+  let path = format!("/proc/self/task/{}/stat", tid);
+  #[allow(clippy::disallowed_methods)]
+  if let Ok(contents) = std::fs::read_to_string(&path) {
+    // Parse utime and stime after pid(comm)
+    if let Some(pos) = contents.rfind(')') {
+      let rest = &contents[pos + 2..]; // skip ") "
+      let fields: Vec<&str> = rest.split_whitespace().collect();
+      // 0=state 1=ppid ... 11=utime 12=stime
+      if fields.len() > 12 {
+        // SAFETY: sysconf call to get clock ticks per second.
+        let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        let utime = fields[11].parse::<f64>().unwrap_or(0.0);
+        let stime = fields[12].parse::<f64>().unwrap_or(0.0);
+        let user_us = utime / ticks_per_sec * 1e6;
+        let system_us = stime / ticks_per_sec * 1e6;
+        return (user_us, system_us);
+      }
+    }
+  }
+  (0.0, 0.0)
+}
+
+#[cfg(windows)]
+fn capture_current_thread_handle() -> u64 {
+  // SAFETY: Returns the thread ID of the calling thread.
+  unsafe { winapi::um::processthreadsapi::GetCurrentThreadId() as u64 }
+}
+
+#[cfg(windows)]
+fn get_thread_cpu_usage_by_handle(handle: u64) -> (f64, f64) {
+  use winapi::shared::minwindef::FALSE;
+  use winapi::shared::minwindef::FILETIME;
+  use winapi::um::handleapi::CloseHandle;
+  use winapi::um::processthreadsapi::GetThreadTimes;
+  use winapi::um::processthreadsapi::OpenThread;
+  use winapi::um::winnt::THREAD_QUERY_INFORMATION;
+
+  let thread_id = handle as u32;
+
+  // SAFETY: Opens a handle to the thread for querying times.
+  let thread_handle =
+    unsafe { OpenThread(THREAD_QUERY_INFORMATION, FALSE, thread_id) };
+  if thread_handle.is_null() {
+    return (0.0, 0.0);
+  }
+
+  let mut creation_time = std::mem::MaybeUninit::<FILETIME>::uninit();
+  let mut exit_time = std::mem::MaybeUninit::<FILETIME>::uninit();
+  let mut kernel_time = std::mem::MaybeUninit::<FILETIME>::uninit();
+  let mut user_time = std::mem::MaybeUninit::<FILETIME>::uninit();
+
+  // SAFETY: Queries thread CPU times.
+  let ret = unsafe {
+    GetThreadTimes(
+      thread_handle,
+      creation_time.as_mut_ptr(),
+      exit_time.as_mut_ptr(),
+      kernel_time.as_mut_ptr(),
+      user_time.as_mut_ptr(),
+    )
+  };
+
+  // SAFETY: Close the thread handle.
+  unsafe { CloseHandle(thread_handle) };
+
+  if ret == FALSE {
+    return (0.0, 0.0);
+  }
+
+  // SAFETY: values are initialized.
+  let user_time = unsafe { user_time.assume_init() };
+  // SAFETY: values are initialized.
+  let kernel_time = unsafe { kernel_time.assume_init() };
+
+  // FILETIME is in 100-nanosecond intervals, convert to microseconds.
+  let user_us = ((user_time.dwHighDateTime as u64) << 32
+    | user_time.dwLowDateTime as u64) as f64
+    / 10.0;
+  let system_us = ((kernel_time.dwHighDateTime as u64) << 32
+    | kernel_time.dwLowDateTime as u64) as f64
+    / 10.0;
+  (user_us, system_us)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn capture_current_thread_handle() -> u64 {
+  0
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn get_thread_cpu_usage_by_handle(_handle: u64) -> (f64, f64) {
+  (0.0, 0.0)
 }

@@ -1,104 +1,215 @@
-# Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+# Copyright 2018-2026 the Deno authors. MIT license.
 
 [package]
 name = "deno"
-version = "1.8.2"
-license = "MIT"
-authors = ["the Deno authors"]
-edition = "2018"
-description = "Provides the deno executable"
-repository = "https://github.com/denoland/deno"
+version = "2.7.1"
+authors.workspace = true
 default-run = "deno"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provides the deno executable"
 
 [[bin]]
 name = "deno"
 path = "main.rs"
+doc = false
 
-[[bin]]
-name = "denort"
-path = "main_runtime.rs"
+[lib]
+path = "lib.rs"
 
-[[bench]]
-name = "deno_bench"
+[[test]]
+name = "integration"
+path = "integration_tests_runner.rs"
 harness = false
-path = "./bench/main.rs"
+
+[features]
+default = ["upgrade", "__vendored_zlib_ng"]
+# A feature that enables heap profiling with dhat on Linux.
+# 1. Compile with `cargo build --profile=release-with-debug --features=dhat-heap`
+# 2. Run the executable. It will output a dhat-heap.json file.
+# 3. Open the json file in https://nnethercote.github.io/dh_view/dh_view.html
+dhat-heap = ["dhat"]
+# A feature that enables the upgrade subcommand and the background check for
+# available updates (of deno binary). This is typically disabled for (Linux)
+# distribution packages.
+upgrade = []
+# A dev feature to disable creations and loading of snapshots in favor of
+# loading JS sources at runtime.
+hmr = ["deno_runtime/hmr", "deno_snapshots/disable"]
+# Vendor zlib as zlib-ng
+__vendored_zlib_ng = ["flate2/zlib-ng-compat", "libz-sys/zlib-ng"]
+lsp-tracing = ["dep:tracing", "dep:tracing-subscriber", "dep:tracing-opentelemetry"]
+# Custom panic trace with `deno_panic`
+panic-trace = ["deno_panic"]
 
 [build-dependencies]
-deno_core = { path = "../core", version = "0.82.0" }
-deno_runtime = { path = "../runtime", version = "0.10.0" }
-regex = "1.4.3"
-serde = { version = "1.0.123", features = ["derive"] }
+deno_runtime = { workspace = true, features = ["include_js_files_for_snapshotting", "only_snapshotted_js_sources"] }
+deno_core = { workspace = true, features = ["include_js_files_for_snapshotting"] }
+lazy-regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zstd.workspace = true
+flate2 = { workspace = true, features = ["default"] }
+deno_error.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
-winapi = "0.3.9"
-winres = "0.1.11"
+winapi.workspace = true
+winres.workspace = true
 
 [dependencies]
-deno_core = { path = "../core", version = "0.82.0" }
-deno_doc = "0.1.23"
-deno_lint = "0.2.19"
-deno_runtime = { path = "../runtime", version = "0.10.0" }
+deno_ast = { workspace = true, features = ["bundler", "cjs", "codegen", "proposal", "react", "sourcemap", "transforms", "typescript", "view", "visit", "utils"] }
+deno_bundle_runtime.workspace = true
+deno_cache_dir = { workspace = true, features = ["sync"] }
+deno_config = { workspace = true, features = ["sync", "workspace"] }
+deno_core = { workspace = true, features = ["include_js_files_for_snapshotting"] }
+deno_doc = { workspace = true, features = ["rust", "comrak"] }
+deno_error.workspace = true
+deno_graph = { workspace = true, features = ["fast_check"] }
+deno_lib.workspace = true
+deno_lint.workspace = true
+deno_lockfile.workspace = true
+deno_media_type = { workspace = true, features = ["data_url", "decoding", "module_specifier"] }
+deno_npm.workspace = true
+deno_npm_cache.workspace = true
+deno_npm_installer = { workspace = true }
+deno_package_json = { workspace = true, features = ["sync"] }
+deno_panic = { version = "0.2.0", optional = true }
+deno_path_util.workspace = true
+deno_resolver = { workspace = true, features = ["deno_ast", "graph", "sync"] }
+deno_runtime = { workspace = true, features = ["include_js_files_for_snapshotting"] }
+deno_semver.workspace = true
+deno_signals.workspace = true
+deno_snapshots.workspace = true
+deno_task_shell.workspace = true
+deno_telemetry.workspace = true
+deno_terminal.workspace = true
+deno_typescript_go_client_rust.workspace = true
+eszip.workspace = true
+libsui.workspace = true
+node_resolver = { workspace = true, features = ["graph", "sync"] }
+node_shim.workspace = true
 
-atty = "0.2.14"
-base64 = "0.13.0"
-byteorder = "1.4.2"
-clap = "2.33.3"
-dissimilar = "1.0.2"
-dprint-plugin-json = "0.9.0"
-dprint-plugin-markdown = "0.6.0"
-dprint-plugin-typescript = "0.41.0"
-encoding_rs = "0.8.28"
-env_logger = "0.8.2"
-filetime = "0.2.14"
-http = "0.2.3"
-indexmap = { version = "1.6.1", features = ["serde"] }
-jsonc-parser = "0.15.1"
-lazy_static = "1.4.0"
-libc = "0.2.86"
-log = { version = "0.4.14", features = ["serde"] }
-lspower = "0.8.4"
-notify = "5.0.0-pre.4"
-percent-encoding = "2.1.0"
-pin-project = "1.0.5"
-regex = "1.4.3"
-ring = "0.16.20"
-rustyline = { version = "8.0.0", default-features = false }
-rustyline-derive = "0.4.0"
-semver-parser = "0.10.2"
-serde = { version = "1.0.123", features = ["derive"] }
-shell-escape = "0.1.5"
-sourcemap = "6.0.1"
-swc_bundler = "0.25.1"
-swc_common = { version = "0.10.12", features = ["sourcemap"] }
-swc_ecmascript = { version = "0.24.1", features = ["codegen", "dep_graph", "parser", "proposal", "react", "transforms", "typescript", "visit"] }
-tempfile = "3.2.0"
-termcolor = "1.1.2"
-text-size = "1.1.0"
-tokio = { version = "1.4.0", features = ["full"] }
-tokio-rustls = "0.22.0"
-uuid = { version = "0.8.2", features = ["v4"] }
-walkdir = "2.3.1"
+anstream.workspace = true
+async-trait.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+bincode.workspace = true
+boxed_error.workspace = true
+bytes.workspace = true
+bytes-str = "0.2.5"
+capacity_builder.workspace = true
+chrono = { workspace = true, features = ["now"] }
+clap = { workspace = true, features = ["env", "string", "wrap_help", "error-context"] }
+clap_complete.workspace = true
+clap_complete_fig.workspace = true
+color-print.workspace = true
+comrak.workspace = true
+console_static_text.workspace = true
+crossterm.workspace = true
+dashmap.workspace = true
+deno_dotenv.workspace = true
+dhat = { workspace = true, optional = true }
+dissimilar.workspace = true
+dprint-core.workspace = true
+dprint-plugin-json.workspace = true
+dprint-plugin-jupyter.workspace = true
+dprint-plugin-markdown.workspace = true
+dprint-plugin-typescript.workspace = true
+esbuild_client = { version = "0.7.1", features = ["serde"] }
+fancy-regex.workspace = true
+faster-hex.workspace = true
+# If you disable the default __vendored_zlib_ng feature above, you _must_ be able to link against `-lz`.
+flate2.workspace = true
+fluent-uri.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+import_map.workspace = true
+indexmap.workspace = true
+jsonc-parser = { workspace = true, features = ["cst", "serde"] }
+jupyter-protocol.workspace = true
+jupyter_runtime.workspace = true
+keyring = { version = "3.6.3", features = ["apple-native", "sync-secret-service", "windows-native", "vendored"] }
+lazy-regex.workspace = true
+libc.workspace = true
+libz-sys.workspace = true
+locked-tripwire = "0.1.1"
+log = { workspace = true, features = ["serde"] }
+lol_html = "2.6.0"
+lsp-types.workspace = true
+malva.workspace = true
+markup_fmt.workspace = true
+memchr.workspace = true
+notify.workspace = true
+once_cell.workspace = true
+open.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+opentelemetry_sdk.workspace = true
+p256.workspace = true
+pathdiff.workspace = true
+percent-encoding.workspace = true
+phf.workspace = true
+pretty_yaml.workspace = true
+quick-junit.workspace = true
+rand = { workspace = true, features = ["small_rng"] }
+regex.workspace = true
+rustc-hash.workspace = true
+rustls.workspace = true
+rustyline.workspace = true
+rustyline-derive.workspace = true
+serde.workspace = true
+serde_repr.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+spki = { workspace = true, features = ["pem"] }
+sqlformat.workspace = true
+strsim.workspace = true
+sys_traits = { workspace = true, features = ["getrandom", "filetime", "libc", "serde_json", "real", "strip_unc", "winapi"] }
+tar.workspace = true
+tempfile.workspace = true
+text-size.workspace = true
+text_lines.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+tower-lsp.workspace = true
+tracing = { workspace = true, features = ["log"], optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"], optional = true }
+twox-hash.workspace = true
+typed-arena.workspace = true
+unicode-width.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+walkdir.workspace = true
+weak-table.workspace = true
+zip = { workspace = true, features = ["deflate-flate2"] }
+zstd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-fwdansi = "1.1.0"
-winapi = { version = "0.3.9", features = ["knownfolders", "mswsock", "objbase", "shlobj", "tlhelp32", "winbase", "winerror", "winsock2"] }
+winapi = { workspace = true, features = ["knownfolders", "mswsock", "objbase", "shlobj", "tlhelp32", "winbase", "winerror", "winsock2"] }
+deno_subprocess_windows.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+shell-escape = "=0.1.5"
+[target.'cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))'.dependencies]
+tokio-vsock.workspace = true
 
 [dev-dependencies]
-# Used in benchmark
-chrono = "0.4.19"
-os_pipe = "0.9.2"
-test_util = { path = "../test_util" }
-tower-test = "0.4.0"
-trust-dns-server = "0.20.0"
-trust-dns-client = "0.20.0"
-
-[target.'cfg(unix)'.dev-dependencies]
-exec = "0.3.1" # Used in test_raw_tty
-nix = "0.20.0"
+# unsafe_use_unprotected_platform is a workaround for a segfault that may occur
+# when running multiple v8 tests on different threads
+deno_core = { workspace = true, features = ["include_js_files_for_snapshotting", "unsafe_use_unprotected_platform"] }
+pretty_assertions.workspace = true
+sys_traits = { workspace = true, features = ["memory"] }
+test_util.workspace = true
 
 [package.metadata.winres]
 # This section defines the metadata that appears in the deno.exe PE header.
 OriginalFilename = "deno.exe"
 LegalCopyright = "© Deno contributors & Deno Land Inc. MIT licensed."
 ProductName = "Deno"
-FileDescription = "A secure runtime for JavaScript and TypeScript."
+FileDescription = "Deno: A secure runtime for JavaScript and TypeScript"

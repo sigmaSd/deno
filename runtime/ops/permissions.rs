@@ -1,129 +1,127 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-use crate::permissions::Permissions;
-use deno_core::error::custom_error;
-use deno_core::error::uri_error;
-use deno_core::error::AnyError;
-use deno_core::serde_json::json;
-use deno_core::serde_json::Value;
-use deno_core::url;
+use ::deno_permissions::PermissionState;
+use ::deno_permissions::PermissionsContainer;
+use deno_core::FromV8;
 use deno_core::OpState;
-use deno_core::ZeroCopyBuf;
-use serde::Deserialize;
-use std::path::Path;
+use deno_core::ToV8;
+use deno_core::op2;
 
-pub fn init(rt: &mut deno_core::JsRuntime) {
-  super::reg_json_sync(rt, "op_query_permission", op_query_permission);
-  super::reg_json_sync(rt, "op_revoke_permission", op_revoke_permission);
-  super::reg_json_sync(rt, "op_request_permission", op_request_permission);
-}
+deno_core::extension!(
+  deno_permissions,
+  ops = [
+    op_query_permission,
+    op_revoke_permission,
+    op_request_permission,
+  ],
+);
 
-#[derive(Deserialize)]
+#[derive(FromV8)]
 pub struct PermissionArgs {
   name: String,
   path: Option<String>,
   host: Option<String>,
+  variable: Option<String>,
+  kind: Option<String>,
+  command: Option<String>,
 }
 
+#[derive(ToV8)]
+pub struct PermissionStatus {
+  state: &'static str,
+  partial: bool,
+}
+
+impl From<PermissionState> for PermissionStatus {
+  fn from(state: PermissionState) -> Self {
+    PermissionStatus {
+      state: match state {
+        PermissionState::Granted | PermissionState::GrantedPartial => "granted",
+        PermissionState::Ignored
+        | PermissionState::DeniedPartial
+        | PermissionState::Denied => "denied",
+        PermissionState::Prompt => "prompt",
+      },
+      partial: state == PermissionState::GrantedPartial,
+    }
+  }
+}
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum PermissionError {
+  #[class(reference)]
+  #[error("No such permission name: {0}")]
+  InvalidPermissionName(String),
+  #[class(inherit)]
+  #[error("{0}")]
+  PathResolve(#[from] ::deno_permissions::PathResolveError),
+  #[class(uri)]
+  #[error("{0}")]
+  NetDescriptorParse(#[from] ::deno_permissions::NetDescriptorParseError),
+  #[class(inherit)]
+  #[error("{0}")]
+  SysDescriptorParse(#[from] ::deno_permissions::SysDescriptorParseError),
+  #[class(inherit)]
+  #[error("{0}")]
+  RunDescriptorParse(#[from] ::deno_permissions::RunDescriptorParseError),
+}
+
+#[op2]
 pub fn op_query_permission(
   state: &mut OpState,
-  args: PermissionArgs,
-  _zero_copy: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  let permissions = state.borrow::<Permissions>();
-  let path = args.path.as_deref();
+  #[scoped] args: PermissionArgs,
+) -> Result<PermissionStatus, PermissionError> {
+  let permissions = state.borrow::<PermissionsContainer>();
   let perm = match args.name.as_ref() {
-    "read" => permissions.read.query(path.as_deref().map(Path::new)),
-    "write" => permissions.write.query(path.as_deref().map(Path::new)),
-    "net" => permissions.net.query(
-      match args.host.as_deref() {
-        None => None,
-        Some(h) => Some(parse_host(h)?),
-      }
-      .as_ref(),
-    ),
-    "env" => permissions.env.query(),
-    "run" => permissions.run.query(),
-    "plugin" => permissions.plugin.query(),
-    "hrtime" => permissions.hrtime.query(),
-    n => {
-      return Err(custom_error(
-        "ReferenceError",
-        format!("No such permission name: {}", n),
-      ))
-    }
+    "read" => permissions.query_read(args.path.as_deref())?,
+    "write" => permissions.query_write(args.path.as_deref())?,
+    "net" => permissions.query_net(args.host.as_deref())?,
+    "env" => permissions.query_env(args.variable.as_deref()),
+    "sys" => permissions.query_sys(args.kind.as_deref())?,
+    "run" => permissions.query_run(args.command.as_deref())?,
+    "ffi" => permissions.query_ffi(args.path.as_deref())?,
+    "import" => permissions.query_import(args.host.as_deref())?,
+    _ => return Err(PermissionError::InvalidPermissionName(args.name)),
   };
-  Ok(json!({ "state": perm.to_string() }))
+  Ok(PermissionStatus::from(perm))
 }
 
+#[op2]
 pub fn op_revoke_permission(
   state: &mut OpState,
-  args: PermissionArgs,
-  _zero_copy: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  let permissions = state.borrow_mut::<Permissions>();
-  let path = args.path.as_deref();
+  #[scoped] args: PermissionArgs,
+) -> Result<PermissionStatus, PermissionError> {
+  let permissions = state.borrow::<PermissionsContainer>();
   let perm = match args.name.as_ref() {
-    "read" => permissions.read.revoke(path.as_deref().map(Path::new)),
-    "write" => permissions.write.revoke(path.as_deref().map(Path::new)),
-    "net" => permissions.net.revoke(
-      match args.host.as_deref() {
-        None => None,
-        Some(h) => Some(parse_host(h)?),
-      }
-      .as_ref(),
-    ),
-    "env" => permissions.env.revoke(),
-    "run" => permissions.run.revoke(),
-    "plugin" => permissions.plugin.revoke(),
-    "hrtime" => permissions.hrtime.revoke(),
-    n => {
-      return Err(custom_error(
-        "ReferenceError",
-        format!("No such permission name: {}", n),
-      ))
-    }
+    "read" => permissions.revoke_read(args.path.as_deref())?,
+    "write" => permissions.revoke_write(args.path.as_deref())?,
+    "net" => permissions.revoke_net(args.host.as_deref())?,
+    "env" => permissions.revoke_env(args.variable.as_deref()),
+    "sys" => permissions.revoke_sys(args.kind.as_deref())?,
+    "run" => permissions.revoke_run(args.command.as_deref())?,
+    "ffi" => permissions.revoke_ffi(args.path.as_deref())?,
+    "import" => permissions.revoke_import(args.host.as_deref())?,
+    _ => return Err(PermissionError::InvalidPermissionName(args.name)),
   };
-  Ok(json!({ "state": perm.to_string() }))
+  Ok(PermissionStatus::from(perm))
 }
 
+#[op2(stack_trace)]
 pub fn op_request_permission(
   state: &mut OpState,
-  args: PermissionArgs,
-  _zero_copy: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  let permissions = state.borrow_mut::<Permissions>();
-  let path = args.path.as_deref();
+  #[scoped] args: PermissionArgs,
+) -> Result<PermissionStatus, PermissionError> {
+  let permissions = state.borrow::<PermissionsContainer>();
   let perm = match args.name.as_ref() {
-    "read" => permissions.read.request(path.as_deref().map(Path::new)),
-    "write" => permissions.write.request(path.as_deref().map(Path::new)),
-    "net" => permissions.net.request(
-      match args.host.as_deref() {
-        None => None,
-        Some(h) => Some(parse_host(h)?),
-      }
-      .as_ref(),
-    ),
-    "env" => permissions.env.request(),
-    "run" => permissions.run.request(),
-    "plugin" => permissions.plugin.request(),
-    "hrtime" => permissions.hrtime.request(),
-    n => {
-      return Err(custom_error(
-        "ReferenceError",
-        format!("No such permission name: {}", n),
-      ))
-    }
+    "read" => permissions.request_read(args.path.as_deref())?,
+    "write" => permissions.request_write(args.path.as_deref())?,
+    "net" => permissions.request_net(args.host.as_deref())?,
+    "env" => permissions.request_env(args.variable.as_deref()),
+    "sys" => permissions.request_sys(args.kind.as_deref())?,
+    "run" => permissions.request_run(args.command.as_deref())?,
+    "ffi" => permissions.request_ffi(args.path.as_deref())?,
+    "import" => permissions.request_import(args.host.as_deref())?,
+    _ => return Err(PermissionError::InvalidPermissionName(args.name)),
   };
-  Ok(json!({ "state": perm.to_string() }))
-}
-
-fn parse_host(host_str: &str) -> Result<(String, Option<u16>), AnyError> {
-  let url = url::Url::parse(&format!("http://{}/", host_str))
-    .map_err(|_| uri_error("Invalid host"))?;
-  if url.path() != "/" {
-    return Err(uri_error("Invalid host"));
-  }
-  let hostname = url.host_str().unwrap();
-  Ok((hostname.to_string(), url.port()))
+  Ok(PermissionStatus::from(perm))
 }

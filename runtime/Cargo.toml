@@ -1,80 +1,115 @@
-# Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+# Copyright 2018-2026 the Deno authors. MIT license.
 
 [package]
 name = "deno_runtime"
-version = "0.10.0"
-license = "MIT"
-authors = ["the Deno authors"]
-edition = "2018"
+version = "0.242.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Provides the deno runtime library"
-repository = "https://github.com/denoland/deno"
+
+[features]
+# "fake" feature that allows to generate docs on docs.rs
+docsrs = []
+# A feature that allows excluding `./js/99_main.js` from the exported extension.
+exclude_runtime_main_js = []
+# A feature that disables embedding of the JavaScript source files in the binary.
+# With this feature enabled, the sources must be consumed during build time,
+# by creating a startup snapshot.
+include_js_files_for_snapshotting = [
+  "deno_core/include_js_files_for_snapshotting",
+]
+# A dev feature to disable creations and loading of snapshots in favor of
+# loading JS sources at runtime.
+hmr = ["include_js_files_for_snapshotting", "transpile"]
+# Signal that only snapshotted JS sources should be used. This will
+# conditionally exclude the runtime source transpilation logic, and add an
+# assertion that a snapshot is provided.
+only_snapshotted_js_sources = ["include_js_files_for_snapshotting"]
+snapshot = ["transpile"]
+transpile = ["deno_ast"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [lib]
 name = "deno_runtime"
 path = "lib.rs"
 
-[[example]]
-name = "hello_runtime"
-path = "examples/hello_runtime.rs"
-
-[build-dependencies]
-deno_core = { path = "../core", version = "0.82.0" }
-deno_console = { path = "../op_crates/console", version = "0.2.0" }
-deno_crypto = { path = "../op_crates/crypto", version = "0.16.0" }
-deno_fetch = { path = "../op_crates/fetch", version = "0.24.0" }
-deno_web = { path = "../op_crates/web", version = "0.32.0" }
-deno_url = { path = "../op_crates/url", version = "0.2.0" }
-deno_webidl = { path = "../op_crates/webidl", version = "0.2.0" }
-deno_websocket = { path = "../op_crates/websocket", version = "0.7.0" }
-deno_webgpu = { path = "../op_crates/webgpu", version = "0.3.0" }
-
-[target.'cfg(windows)'.build-dependencies]
-winres = "0.1.11"
-winapi = "0.3.9"
-
 [dependencies]
-deno_core = { path = "../core", version = "0.82.0" }
-deno_console = { path = "../op_crates/console", version = "0.2.0" }
-deno_crypto = { path = "../op_crates/crypto", version = "0.16.0" }
-deno_fetch = { path = "../op_crates/fetch", version = "0.24.0" }
-deno_web = { path = "../op_crates/web", version = "0.32.0" }
-deno_url = { path = "../op_crates/url", version = "0.2.0" }
-deno_webidl = { path = "../op_crates/webidl", version = "0.2.0" }
-deno_websocket = { path = "../op_crates/websocket", version = "0.7.0" }
-deno_webgpu = { path = "../op_crates/webgpu", version = "0.3.0" }
+deno_ast = { workspace = true, optional = true }
+deno_bundle_runtime.workspace = true
+deno_cache.workspace = true
+deno_core.workspace = true
+deno_cron.workspace = true
+deno_crypto.workspace = true
+deno_error.workspace = true
+deno_features.workspace = true
+deno_fetch.workspace = true
+deno_ffi.workspace = true
+deno_fs = { workspace = true, features = ["sync_fs"] }
+deno_http.workspace = true
+deno_image.workspace = true
+deno_inspector_server.workspace = true
+deno_io.workspace = true
+deno_kv.workspace = true
+deno_napi.workspace = true
+deno_net.workspace = true
+deno_node.workspace = true
+deno_node_crypto.workspace = true
+deno_node_sqlite.workspace = true
+deno_os.workspace = true
+deno_path_util.workspace = true
+deno_permissions.workspace = true
+deno_process.workspace = true
+deno_resolver = { workspace = true, features = ["sync"] }
+deno_signals.workspace = true
+deno_telemetry.workspace = true
+deno_terminal.workspace = true
+deno_tls.workspace = true
+deno_web.workspace = true
+deno_webgpu.workspace = true
+deno_webidl.workspace = true
+deno_websocket.workspace = true
+deno_webstorage.workspace = true
+node_resolver = { workspace = true, features = ["sync"] }
 
-atty = "0.2.14"
-dlopen = "0.1.8"
-encoding_rs = "0.8.28"
-filetime = "0.2.14"
-http = "0.2.3"
-hyper = { version = "0.14.4", features = ["server"] }
-indexmap = "1.6.1"
-lazy_static = "1.4.0"
-libc = "0.2.86"
-log = "0.4.14"
-notify = "5.0.0-pre.4"
-percent-encoding = "2.1.0"
-regex = "1.4.3"
-ring = "0.16.20"
-serde = { version = "1.0.123", features = ["derive"] }
-sys-info = "0.8.0"
-termcolor = "1.1.2"
-tokio = { version = "1.4.0", features = ["full"] }
-tokio-rustls = "0.22.0"
-uuid = { version = "0.8.2", features = ["v4"] }
-webpki = "0.21.4"
-webpki-roots = "0.21.0"
-trust-dns-proto = "0.20.0"
-trust-dns-resolver = { version = "0.20.0", features = ["tokio-runtime", "serde-config"] }
+async-trait.workspace = true
+color-print.workspace = true
+encoding_rs.workspace = true
+fastwebsockets.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+indexmap.workspace = true
+libc.workspace = true
+log.workspace = true
+notify.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+rustyline = { workspace = true, features = ["custom-bindings"] }
+same-file.workspace = true
+serde.workspace = true
+sys_traits.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-metrics.workspace = true
+twox-hash.workspace = true
+uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-fwdansi = "1.1.0"
-winapi = { version = "0.3.9", features = ["knownfolders", "mswsock", "objbase", "shlobj", "tlhelp32", "winbase", "winerror", "winsock2"] }
+winapi = { workspace = true, features = ["commapi", "handleapi", "knownfolders", "mswsock", "objbase", "processthreadsapi", "psapi", "shlobj", "tlhelp32", "winbase", "winerror", "winnt", "winuser", "winsock2"] }
+ntapi = "0.4.0"
+windows-sys.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = "0.20.0"
+nix.workspace = true
 
 [dev-dependencies]
 # Used in benchmark
-test_util = { path = "../test_util" }
+test_util.workspace = true
+
+[package.metadata.docs.rs]
+features = ["docsrs"]

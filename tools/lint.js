@@ -1,106 +1,442 @@
-#!/usr/bin/env -S deno run --unstable --allow-write --allow-read --allow-run
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+#!/usr/bin/env -S deno run --allow-all --config=tests/config/deno.json
+// Copyright 2018-2026 the Deno authors. MIT license.
+
+// deno-lint-ignore-file no-console
+
 import {
   buildMode,
-  getPrebuiltToolPath,
+  dirname,
+  getPrebuilt,
   getSources,
+  gitLsFiles,
   join,
+  parseJSONC,
   ROOT_PATH,
+  SEPARATOR,
+  walk,
 } from "./util.js";
+import { assertEquals } from "@std/assert";
+import { checkCopyright } from "./copyright_checker.js";
+import * as ciFile from "../.github/workflows/ci.generate.ts";
+
+const promises = [];
+
+let js = Deno.args.includes("--js");
+let rs = Deno.args.includes("--rs");
+if (!js && !rs) {
+  js = true;
+  rs = true;
+}
+
+if (rs) {
+  promises.push(clippy());
+  promises.push(ensureNoNonPermissionCapitalLetterShortFlags());
+}
+
+if (js) {
+  promises.push(dlint());
+  promises.push(dlintPreferPrimordials());
+  promises.push(ensureCiYmlUpToDate());
+  promises.push(ensureNoUnusedOutFiles());
+  promises.push(ensureNoNewTopLevelEntries());
+
+  if (rs) {
+    promises.push(checkCopyright());
+  }
+}
+
+const results = await Promise.allSettled(promises);
+for (const result of results) {
+  if (result.status === "rejected") {
+    console.error(result.reason);
+    Deno.exit(1);
+  }
+}
 
 async function dlint() {
   const configFile = join(ROOT_PATH, ".dlint.json");
-  const execPath = getPrebuiltToolPath("dlint");
-  console.log("dlint");
+  const execPath = await getPrebuilt("dlint");
 
   const sourceFiles = await getSources(ROOT_PATH, [
     "*.js",
     "*.ts",
-    ":!:cli/tests/swc_syntax_error.ts",
-    ":!:cli/tests/038_checkjs.js",
-    ":!:cli/tests/error_008_checkjs.js",
-    ":!:std/**/testdata/*",
-    ":!:std/**/node_modules/*",
-    ":!:cli/bench/node*.js",
+    ":!:.github/mtime_cache/action.js",
     ":!:cli/compilers/wasm_wrap.js",
-    ":!:cli/dts/**",
-    ":!:cli/tests/encoding/**",
-    ":!:cli/tests/error_syntax.js",
-    ":!:cli/tests/unit/**",
-    ":!:cli/tests/lint/**",
-    ":!:cli/tests/tsc/**",
+    ":!:cli/tools/coverage/script.js",
+    ":!:cli/tools/doc/prism.css",
+    ":!:cli/tools/doc/prism.js",
+    ":!:cli/tsc/dts/**",
     ":!:cli/tsc/*typescript.js",
-    ":!:test_util/wpt/**",
+    ":!:cli/tsc/compiler.d.ts",
+    ":!:ext/node/polyfills/deps/**",
+    ":!:runtime/examples/",
+    ":!:libs/eszip/testdata/**",
+    ":!:target/",
+    ":!:tests/bench/testdata/npm/*",
+    ":!:tests/bench/testdata/express-router.js",
+    ":!:tests/bench/testdata/react-dom.js",
+    ":!:tests/ffi/testdata/test.js",
+    ":!:tests/registry/**",
+    ":!:tests/specs/**",
+    ":!:tests/testdata/**",
+    ":!:tests/unit_node/testdata/**",
+    ":!:tests/wpt/runner/**",
+    ":!:tests/wpt/suite/**",
+    ":!:libs/**",
   ]);
 
   if (!sourceFiles.length) {
     return;
   }
 
-  const MAX_COMMAND_LEN = 30000;
-  const preCommand = [execPath, "run"];
-  const chunks = [[]];
-  let cmdLen = preCommand.join(" ").length;
-  for (const f of sourceFiles) {
-    if (cmdLen + f.length > MAX_COMMAND_LEN) {
-      chunks.push([f]);
-      cmdLen = preCommand.join(" ").length;
-    } else {
-      chunks[chunks.length - 1].push(f);
-      cmdLen = preCommand.join(" ").length;
-    }
-  }
+  const chunks = splitToChunks(sourceFiles, `${execPath} run`.length);
+  const pending = [];
   for (const chunk of chunks) {
-    const p = Deno.run({
-      cmd: [execPath, "run", "--config=" + configFile, ...chunk],
+    const cmd = new Deno.Command(execPath, {
+      cwd: ROOT_PATH,
+      args: ["run", "--config=" + configFile, ...chunk],
+      // capture to not conflict with clippy output
+      stderr: "piped",
     });
-    const { success } = await p.status();
-    if (!success) {
-      throw new Error("dlint failed");
-    }
-    p.close();
+    pending.push(
+      cmd.output().then(({ stderr, code }) => {
+        if (code > 0) {
+          const decoder = new TextDecoder();
+          console.log("\n------ dlint ------");
+          console.log(decoder.decode(stderr));
+          throw new Error("dlint failed");
+        }
+      }),
+    );
   }
+  const results = await Promise.allSettled(pending);
+  for (const result of results) {
+    if (result.status === "rejected") {
+      throw new Error(result.reason);
+    }
+  }
+}
+
+// `prefer-primordials` has to apply only to files related to bootstrapping,
+// which is different from other lint rules. This is why this dedicated function
+// is needed.
+async function dlintPreferPrimordials() {
+  const execPath = await getPrebuilt("dlint");
+  const sourceFiles = await getSources(ROOT_PATH, [
+    "runtime/**/*.js",
+    "runtime/**/*.ts",
+    "ext/**/*.js",
+    "ext/**/*.ts",
+    ":!:ext/**/*.d.ts",
+    "ext/node/polyfills/*.mjs",
+    ":!:ext/node/polyfills/deps/**",
+  ]);
+
+  if (!sourceFiles.length) {
+    return;
+  }
+
+  const chunks = splitToChunks(sourceFiles, `${execPath} run`.length);
+  for (const chunk of chunks) {
+    const cmd = new Deno.Command(execPath, {
+      cwd: ROOT_PATH,
+      args: ["run", "--rule", "prefer-primordials", ...chunk],
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const { code } = await cmd.output();
+
+    if (code > 0) {
+      throw new Error("prefer-primordials failed");
+    }
+  }
+}
+
+function splitToChunks(paths, initCmdLen) {
+  let cmdLen = initCmdLen;
+  const MAX_COMMAND_LEN = 30000;
+  const chunks = [[]];
+  for (const p of paths) {
+    if (cmdLen + p.length > MAX_COMMAND_LEN) {
+      chunks.push([p]);
+      cmdLen = initCmdLen;
+    } else {
+      chunks[chunks.length - 1].push(p);
+      cmdLen += p.length;
+    }
+  }
+  return chunks;
 }
 
 async function clippy() {
-  console.log("clippy");
-
   const currentBuildMode = buildMode();
-  const cmd = ["cargo", "clippy", "--all-targets", "--locked"];
 
-  if (currentBuildMode != "debug") {
-    cmd.push("--release");
+  const clippyDenyFlags = [
+    "--",
+    "-D",
+    "warnings",
+    "--deny",
+    "clippy::unused_async",
+    // generally prefer the `log` crate, but ignore
+    // these print_* rules if necessary
+    "--deny",
+    "clippy::print_stderr",
+    "--deny",
+    "clippy::print_stdout",
+    "--deny",
+    "clippy::large_futures",
+  ];
+
+  // Run clippy for the whole workspace except deno_core with --all-features.
+  // deno_core is excluded because --all-features enables
+  // v8_enable_pointer_compression which is not available on all platforms.
+  {
+    const cmd = [
+      "clippy",
+      "--all-targets",
+      "--all-features",
+      "--locked",
+      "--workspace",
+      "--exclude",
+      "deno_core",
+    ];
+
+    if (currentBuildMode != "debug") {
+      cmd.push("--release");
+    }
+
+    const cargoCmd = new Deno.Command("cargo", {
+      cwd: ROOT_PATH,
+      args: [...cmd, ...clippyDenyFlags],
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const { code } = await cargoCmd.output();
+
+    if (code > 0) {
+      throw new Error("clippy failed");
+    }
   }
 
-  const p = Deno.run({
-    cmd: [...cmd, "--", "-D", "clippy::all"],
+  // Run clippy for deno_core with specific features, matching the invocation
+  // from https://github.com/denoland/deno_core/blob/main/tools/lint.ts
+  {
+    const DENO_CORE_CLIPPY_FEATURES = [
+      "default",
+      "include_js_files_for_snapshotting",
+      "unsafe_runtime_options",
+      "unsafe_use_unprotected_platform",
+    ].join(",");
+
+    const cmd = [
+      "clippy",
+      "-p",
+      "deno_core",
+      "--all-targets",
+      "--locked",
+      "--features",
+      DENO_CORE_CLIPPY_FEATURES,
+    ];
+
+    if (currentBuildMode != "debug") {
+      cmd.push("--release");
+    }
+
+    const cargoCmd = new Deno.Command("cargo", {
+      cwd: ROOT_PATH,
+      args: [...cmd, ...clippyDenyFlags],
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const { code } = await cargoCmd.output();
+
+    if (code > 0) {
+      throw new Error("clippy failed for deno_core");
+    }
+  }
+}
+
+async function ensureCiYmlUpToDate() {
+  const expectedCiFileText = ciFile.generate();
+  const actualCiFileText = await Deno.readTextFile(ciFile.CI_YML_URL);
+  if (expectedCiFileText !== actualCiFileText) {
+    throw new Error(
+      "./.github/workflows/ci.yml is out of date. Run: ./.github/workflows/ci.generate.ts",
+    );
+  }
+}
+
+/**
+ * When short permission flags were being proposed, a concern that was raised was that
+ * it would degrade the permission system by making the flags obscure. To address this
+ * concern, we decided to make uppercase short flags ONLY relate to permissions. That
+ * way if someone specifies something like `-E`, the user can scrutinize the command
+ * a bit more than if it were `-e`. This custom lint rule attempts to try to maintain
+ * this convention.
+ */
+async function ensureNoNonPermissionCapitalLetterShortFlags() {
+  const text = await Deno.readTextFile(join(ROOT_PATH, "cli/args/flags.rs"));
+  const shortFlags = text.matchAll(/\.short\('([A-Z])'\)/g);
+  const values = Array.from(shortFlags.map((flag) => flag[1])).sort();
+  // DO NOT update this list with a non-permission short flag without
+  // discussion--there needs to be precedence to add to this list.
+  const expected = [
+    // --allow-all
+    "A",
+    // --dev flag for `deno install` (precedence: `npm install -D <package>`)
+    "D",
+    // --allow-env
+    "E",
+    // --allow-import
+    "I",
+    // log level (precedence: legacy)
+    "L",
+    // --allow-net
+    "N",
+    // --permission-set
+    "P",
+    // --allow-read
+    "R",
+    // --allow-sys
+    "S",
+    // version flag (precedence: legacy)
+    "V",
+    // --allow-write
+    "W",
+  ];
+  assertEquals(values, expected);
+}
+
+async function ensureNoUnusedOutFiles() {
+  const specsDir = join(ROOT_PATH, "tests", "specs");
+  const outFilePaths = new Set(
+    (await Array.fromAsync(
+      walk(specsDir, { exts: [".out"] }),
+    )).map((entry) => entry.path),
+  );
+  const testFiles = (await Array.fromAsync(
+    walk(specsDir, { exts: [".jsonc"] }),
+  )).filter((entry) => {
+    return entry.path.endsWith("__test__.jsonc");
   });
-  const { success } = await p.status();
-  if (!success) {
-    throw new Error("clippy failed");
+
+  function checkObject(baseDirPath, obj, substsInit = {}) {
+    const substs = { ...substsInit };
+
+    if ("variants" in obj) {
+      for (const variantValue of Object.values(obj.variants)) {
+        for (const [substKey, substValue] of Object.entries(variantValue)) {
+          const subst = `\$\{${substKey}\}`;
+          if (subst in substs) {
+            substs[subst].push(substValue);
+          } else {
+            substs[subst] = [substValue];
+          }
+        }
+      }
+    }
+    for (const [key, value] of Object.entries(obj)) {
+      if (typeof value === "object") {
+        checkObject(baseDirPath, value, substs);
+      } else if (key === "output" && typeof value === "string") {
+        for (const [subst, substValues] of Object.entries(substs)) {
+          if (value.includes(subst)) {
+            for (const substValue of substValues) {
+              const substitutedValue = value.replaceAll(subst, substValue);
+              const substitutedOutFilePath = join(
+                baseDirPath,
+                substitutedValue,
+              );
+              outFilePaths.delete(substitutedOutFilePath);
+            }
+          }
+        }
+        const outFilePath = join(baseDirPath, value);
+        outFilePaths.delete(outFilePath);
+      }
+    }
   }
-  p.close();
+
+  for (const testFile of testFiles) {
+    try {
+      const text = await Deno.readTextFile(testFile.path);
+      const data = parseJSONC(text);
+      checkObject(dirname(testFile.path), data);
+    } catch (err) {
+      throw new Error("Failed reading: " + testFile.path, {
+        cause: err,
+      });
+    }
+  }
+
+  const notFoundPaths = Array.from(outFilePaths);
+  if (notFoundPaths.length > 0) {
+    notFoundPaths.sort(); // be deterministic
+    for (const file of notFoundPaths) {
+      console.error(`Unreferenced .out file: ${file}`);
+    }
+    throw new Error(`${notFoundPaths.length} unreferenced .out files`);
+  }
 }
 
-async function main() {
-  await Deno.chdir(ROOT_PATH);
-
-  let didLint = false;
-
-  if (Deno.args.includes("--js")) {
-    await dlint();
-    didLint = true;
-  }
-
-  if (Deno.args.includes("--rs")) {
-    await clippy();
-    didLint = true;
-  }
-
-  if (!didLint) {
-    await dlint();
-    await clippy();
-  }
+async function listTopLevelEntries() {
+  const files = await gitLsFiles(ROOT_PATH, []);
+  const rootPrefix = ROOT_PATH.replace(new RegExp(SEPARATOR + "$"), "") +
+    SEPARATOR;
+  return [
+    ...new Set(
+      files.map((f) => f.replace(rootPrefix, ""))
+        .map((file) => {
+          const sepIndex = file.indexOf(SEPARATOR);
+          // top-level file or first path component (directory)
+          return sepIndex === -1 ? file : file.substring(0, sepIndex);
+        }),
+    ),
+  ].sort();
 }
 
-await main();
+async function ensureNoNewTopLevelEntries() {
+  const currentEntries = await listTopLevelEntries();
+
+  // WARNING: When adding anything to this list it must be discussed!
+  // Keep the root of the repository clean.
+  const allowed = new Set([
+    ".cargo",
+    ".devcontainer",
+    ".github",
+    "cli",
+    "ext",
+    "libs",
+    "runtime",
+    "tests",
+    "tools",
+    ".dlint.json",
+    ".dprint.json",
+    ".editorconfig",
+    ".gitattributes",
+    // WARNING! See Notice above before adding anything here
+    ".gitignore",
+    ".gitmodules",
+    ".rustfmt.toml",
+    "CLAUDE.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "LICENSE.md",
+    "README.md",
+    "Releases.md",
+    "import_map.json",
+    "rust-toolchain.toml",
+    "flake.nix",
+    "flake.lock",
+  ]);
+
+  const newEntries = currentEntries.filter((e) => !allowed.has(e));
+  if (newEntries.length > 0) {
+    throw new Error(
+      `New top-level entries detected: ${newEntries.join(", ")}. ` +
+        `Only the following top-level entries are allowed: ${
+          Array.from(allowed).join(", ")
+        }`,
+    );
+  }
+}

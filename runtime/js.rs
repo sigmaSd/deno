@@ -1,36 +1,8 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-use deno_core::Snapshot;
+#[cfg(not(feature = "include_js_files_for_snapshotting"))]
+pub static SOURCE_CODE_FOR_99_MAIN_JS: &str = include_str!("js/99_main.js");
 
-pub static CLI_SNAPSHOT: &[u8] =
-  include_bytes!(concat!(env!("OUT_DIR"), "/CLI_SNAPSHOT.bin"));
-
-pub fn deno_isolate_init() -> Snapshot {
-  debug!("Deno isolate init with snapshots.");
-  let data = CLI_SNAPSHOT;
-  Snapshot::Static(data)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn cli_snapshot() {
-    let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-      startup_snapshot: Some(deno_isolate_init()),
-      ..Default::default()
-    });
-    js_runtime
-      .execute(
-        "<anon>",
-        r#"
-      if (!(bootstrap.mainRuntime && bootstrap.workerRuntime)) {
-        throw Error("bad");
-      }
-      console.log("we have console.log!!!");
-    "#,
-      )
-      .unwrap();
-  }
-}
+#[cfg(feature = "include_js_files_for_snapshotting")]
+pub static PATH_FOR_99_MAIN_JS: &str =
+  concat!(env!("CARGO_MANIFEST_DIR"), "/js/99_main.js");

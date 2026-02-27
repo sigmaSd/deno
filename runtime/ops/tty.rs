@@ -1,79 +1,126 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
-
-use super::io::StdFileResource;
-use deno_core::error::bad_resource_id;
-use deno_core::error::not_supported;
-use deno_core::error::resource_unavailable;
-use deno_core::error::AnyError;
-use deno_core::serde_json::json;
-use deno_core::serde_json::Value;
-use deno_core::OpState;
-use deno_core::RcRef;
-use deno_core::ResourceId;
-use deno_core::ZeroCopyBuf;
-use serde::Deserialize;
-use serde::Serialize;
-use std::io::Error;
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 #[cfg(unix)]
-use nix::sys::termios;
-
+use std::cell::RefCell;
+#[cfg(unix)]
+use std::collections::HashMap;
+use std::io::Error;
 #[cfg(windows)]
-use deno_core::error::custom_error;
+use std::sync::Arc;
+
+use deno_core::OpState;
+#[cfg(unix)]
+use deno_core::ResourceId;
+use deno_core::op2;
+#[cfg(windows)]
+use deno_core::parking_lot::Mutex;
+use deno_error::JsErrorBox;
+use deno_error::JsErrorClass;
+use deno_error::builtin_classes::GENERIC_ERROR;
+#[cfg(windows)]
+use deno_io::WinTtyState;
+#[cfg(unix)]
+use nix::sys::termios;
+use rustyline::Cmd;
+use rustyline::Editor;
+use rustyline::KeyCode;
+use rustyline::KeyEvent;
+use rustyline::Modifiers;
+use rustyline::config::Configurer;
+use rustyline::error::ReadlineError;
+
+#[cfg(unix)]
+#[derive(Default, Clone)]
+struct TtyModeStore(
+  std::rc::Rc<RefCell<HashMap<ResourceId, termios::Termios>>>,
+);
+
+#[cfg(unix)]
+impl TtyModeStore {
+  pub fn get(&self, id: ResourceId) -> Option<termios::Termios> {
+    self.0.borrow().get(&id).map(ToOwned::to_owned)
+  }
+
+  pub fn take(&self, id: ResourceId) -> Option<termios::Termios> {
+    self.0.borrow_mut().remove(&id)
+  }
+
+  pub fn set(&self, id: ResourceId, mode: termios::Termios) {
+    self.0.borrow_mut().insert(id, mode);
+  }
+}
+
+#[cfg(unix)]
+use deno_process::JsNixError;
 #[cfg(windows)]
 use winapi::shared::minwindef::DWORD;
 #[cfg(windows)]
 use winapi::um::wincon;
+
+deno_core::extension!(
+  deno_tty,
+  ops = [op_set_raw, op_console_size, op_read_line_prompt],
+  state = |state| {
+    #[cfg(unix)]
+    state.put(TtyModeStore::default());
+    #[cfg(not(unix))]
+    let _ = state;
+  },
+);
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum TtyError {
+  #[class(inherit)]
+  #[error(transparent)]
+  Resource(
+    #[from]
+    #[inherit]
+    deno_core::error::ResourceError,
+  ),
+  #[class(inherit)]
+  #[error("{0}")]
+  Io(
+    #[from]
+    #[inherit]
+    Error,
+  ),
+  #[cfg(unix)]
+  #[class(inherit)]
+  #[error(transparent)]
+  Nix(#[inherit] JsNixError),
+  #[class(inherit)]
+  #[error(transparent)]
+  Other(#[inherit] JsErrorBox),
+}
+
+// ref: <https://learn.microsoft.com/en-us/windows/console/setconsolemode>
 #[cfg(windows)]
-const RAW_MODE_MASK: DWORD = wincon::ENABLE_LINE_INPUT
+const COOKED_MODE: DWORD =
+  // enable line-by-line input (returns input only after CR is read)
+  wincon::ENABLE_LINE_INPUT
+  // enables real-time character echo to console display (requires ENABLE_LINE_INPUT)
   | wincon::ENABLE_ECHO_INPUT
+  // system handles CTRL-C (with ENABLE_LINE_INPUT, also handles BS, CR, and LF) and other control keys (when using `ReadFile` or `ReadConsole`)
   | wincon::ENABLE_PROCESSED_INPUT;
 
 #[cfg(windows)]
-fn get_windows_handle(
-  f: &std::fs::File,
-) -> Result<std::os::windows::io::RawHandle, AnyError> {
-  use std::os::windows::io::AsRawHandle;
-  use winapi::um::handleapi;
-
-  let handle = f.as_raw_handle();
-  if handle == handleapi::INVALID_HANDLE_VALUE {
-    return Err(Error::last_os_error().into());
-  } else if handle.is_null() {
-    return Err(custom_error("ReferenceError", "null handle"));
-  }
-  Ok(handle)
+fn mode_raw_input_on(original_mode: DWORD) -> DWORD {
+  original_mode & !COOKED_MODE | wincon::ENABLE_VIRTUAL_TERMINAL_INPUT
 }
 
-pub fn init(rt: &mut deno_core::JsRuntime) {
-  super::reg_json_sync(rt, "op_set_raw", op_set_raw);
-  super::reg_json_sync(rt, "op_isatty", op_isatty);
-  super::reg_json_sync(rt, "op_console_size", op_console_size);
+#[cfg(windows)]
+fn mode_raw_input_off(original_mode: DWORD) -> DWORD {
+  original_mode & !wincon::ENABLE_VIRTUAL_TERMINAL_INPUT | COOKED_MODE
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetRawOptions {
-  cbreak: bool,
-}
-
-#[derive(Deserialize)]
-pub struct SetRawArgs {
-  rid: ResourceId,
-  mode: bool,
-  options: SetRawOptions,
-}
-
+#[op2(fast)]
 fn op_set_raw(
   state: &mut OpState,
-  args: SetRawArgs,
-  _zero_copy: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  super::check_unstable(state, "Deno.setRaw");
-
-  let rid = args.rid;
-  let is_raw = args.mode;
-  let cbreak = args.options.cbreak;
+  rid: u32,
+  is_raw: bool,
+  cbreak: bool,
+) -> Result<(), TtyError> {
+  let handle_or_fd = state.resource_table.get_fd(rid)?;
 
   // From https://github.com/kkawakam/rustyline/blob/master/src/tty/windows.rs
   // and https://github.com/kkawakam/rustyline/blob/master/src/tty/unix.rs
@@ -82,109 +129,164 @@ fn op_set_raw(
   // Copyright (c) 2019 Timon. MIT license.
   #[cfg(windows)]
   {
-    use std::os::windows::io::AsRawHandle;
+    use deno_error::JsErrorBox;
     use winapi::shared::minwindef::FALSE;
-    use winapi::um::{consoleapi, handleapi};
+    use winapi::um::consoleapi;
 
-    let resource = state
-      .resource_table
-      .get::<StdFileResource>(rid)
-      .ok_or_else(bad_resource_id)?;
+    let handle = handle_or_fd;
 
     if cbreak {
-      return Err(not_supported());
+      return Err(TtyError::Other(JsErrorBox::not_supported()));
     }
 
-    if resource.fs_file.is_none() {
-      return Err(bad_resource_id());
-    }
-
-    let fs_file_resource =
-      RcRef::map(&resource, |r| r.fs_file.as_ref().unwrap()).try_borrow_mut();
-
-    let handle_result = if let Some(mut fs_file) = fs_file_resource {
-      let tokio_file = fs_file.0.take().unwrap();
-      match tokio_file.try_into_std() {
-        Ok(std_file) => {
-          let raw_handle = std_file.as_raw_handle();
-          // Turn the std_file handle back into a tokio file, put it back
-          // in the resource table.
-          let tokio_file = tokio::fs::File::from_std(std_file);
-          fs_file.0 = Some(tokio_file);
-          // return the result.
-          Ok(raw_handle)
-        }
-        Err(tokio_file) => {
-          // This function will return an error containing the file if
-          // some operation is in-flight.
-          fs_file.0 = Some(tokio_file);
-          Err(resource_unavailable())
-        }
-      }
-    } else {
-      Err(resource_unavailable())
-    };
-
-    let handle = handle_result?;
-
-    if handle == handleapi::INVALID_HANDLE_VALUE {
-      return Err(Error::last_os_error().into());
-    } else if handle.is_null() {
-      return Err(custom_error("ReferenceError", "null handle"));
-    }
     let mut original_mode: DWORD = 0;
+    // SAFETY: winapi call
     if unsafe { consoleapi::GetConsoleMode(handle, &mut original_mode) }
       == FALSE
     {
-      return Err(Error::last_os_error().into());
-    }
-    let new_mode = if is_raw {
-      original_mode & !RAW_MODE_MASK
-    } else {
-      original_mode | RAW_MODE_MASK
-    };
-    if unsafe { consoleapi::SetConsoleMode(handle, new_mode) } == FALSE {
-      return Err(Error::last_os_error().into());
+      return Err(TtyError::Io(Error::last_os_error()));
     }
 
-    Ok(json!({}))
+    let new_mode = if is_raw {
+      mode_raw_input_on(original_mode)
+    } else {
+      mode_raw_input_off(original_mode)
+    };
+
+    let stdin_state = state.borrow::<Arc<Mutex<WinTtyState>>>();
+    let mut stdin_state = stdin_state.lock();
+
+    if stdin_state.reading {
+      let cvar = stdin_state.cvar.clone();
+
+      /* Trick to unblock an ongoing line-buffered read operation if not already pending.
+      See https://github.com/libuv/libuv/pull/866 for prior art */
+      if original_mode & COOKED_MODE != 0 && !stdin_state.cancelled {
+        // SAFETY: Write enter key event to force the console wait to return.
+        let record = unsafe {
+          let mut record: wincon::INPUT_RECORD = std::mem::zeroed();
+          record.EventType = wincon::KEY_EVENT;
+          record.Event.KeyEvent_mut().wVirtualKeyCode =
+            winapi::um::winuser::VK_RETURN as u16;
+          record.Event.KeyEvent_mut().bKeyDown = 1;
+          record.Event.KeyEvent_mut().wRepeatCount = 1;
+          *record.Event.KeyEvent_mut().uChar.UnicodeChar_mut() = '\r' as u16;
+          record.Event.KeyEvent_mut().dwControlKeyState = 0;
+          record.Event.KeyEvent_mut().wVirtualScanCode =
+            winapi::um::winuser::MapVirtualKeyW(
+              winapi::um::winuser::VK_RETURN as u32,
+              winapi::um::winuser::MAPVK_VK_TO_VSC,
+            ) as u16;
+          record
+        };
+        stdin_state.cancelled = true;
+
+        // SAFETY: winapi call to open conout$ and save screen state.
+        let active_screen_buffer = unsafe {
+          /* Save screen state before sending the VK_RETURN event */
+          let handle = winapi::um::fileapi::CreateFileW(
+            "conout$"
+              .encode_utf16()
+              .chain(Some(0))
+              .collect::<Vec<_>>()
+              .as_ptr(),
+            winapi::um::winnt::GENERIC_READ | winapi::um::winnt::GENERIC_WRITE,
+            winapi::um::winnt::FILE_SHARE_READ
+              | winapi::um::winnt::FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            winapi::um::fileapi::OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+          );
+
+          let mut active_screen_buffer = std::mem::zeroed();
+          winapi::um::wincon::GetConsoleScreenBufferInfo(
+            handle,
+            &mut active_screen_buffer,
+          );
+          winapi::um::handleapi::CloseHandle(handle);
+          active_screen_buffer
+        };
+        stdin_state.screen_buffer_info = Some(active_screen_buffer);
+
+        // SAFETY: winapi call to write the VK_RETURN event.
+        if unsafe {
+          winapi::um::wincon::WriteConsoleInputW(handle, &record, 1, &mut 0)
+        } == FALSE
+        {
+          return Err(TtyError::Io(Error::last_os_error()));
+        }
+
+        /* Wait for read thread to acknowledge the cancellation to ensure that nothing
+        interferes with the screen state.
+        NOTE: `wait_while` automatically unlocks stdin_state */
+        cvar.wait_while(&mut stdin_state, |state: &mut WinTtyState| {
+          state.cancelled
+        });
+      }
+    }
+
+    // SAFETY: winapi call
+    if unsafe { consoleapi::SetConsoleMode(handle, new_mode) } == FALSE {
+      return Err(TtyError::Io(Error::last_os_error()));
+    }
+
+    Ok(())
   }
   #[cfg(unix)]
   {
-    use std::os::unix::io::AsRawFd;
+    fn prepare_stdio() {
+      // SAFETY: Save current state of stdio and restore it when we exit.
+      unsafe {
+        use libc::atexit;
+        use libc::tcgetattr;
+        use libc::tcsetattr;
+        use libc::termios;
+        use once_cell::sync::OnceCell;
 
-    let resource = state
-      .resource_table
-      .get::<StdFileResource>(rid)
-      .ok_or_else(bad_resource_id)?;
+        // Only save original state once.
+        static ORIG_TERMIOS: OnceCell<Option<termios>> = OnceCell::new();
+        ORIG_TERMIOS.get_or_init(|| {
+          let mut termios = std::mem::zeroed::<termios>();
+          if tcgetattr(libc::STDIN_FILENO, &mut termios) == 0 {
+            extern "C" fn reset_stdio() {
+              // SAFETY: Reset the stdio state.
+              unsafe {
+                tcsetattr(
+                  libc::STDIN_FILENO,
+                  0,
+                  &ORIG_TERMIOS.get().unwrap().unwrap(),
+                )
+              };
+            }
 
-    if resource.fs_file.is_none() {
-      return Err(not_supported());
+            atexit(reset_stdio);
+            return Some(termios);
+          }
+
+          None
+        });
+      }
     }
 
-    let maybe_fs_file_resource =
-      RcRef::map(&resource, |r| r.fs_file.as_ref().unwrap()).try_borrow_mut();
+    prepare_stdio();
+    let tty_mode_store = state.borrow::<TtyModeStore>().clone();
+    let previous_mode = tty_mode_store.get(rid);
 
-    if maybe_fs_file_resource.is_none() {
-      return Err(resource_unavailable());
-    }
-
-    let mut fs_file_resource = maybe_fs_file_resource.unwrap();
-    if fs_file_resource.0.is_none() {
-      return Err(resource_unavailable());
-    }
-
-    let raw_fd = fs_file_resource.0.as_ref().unwrap().as_raw_fd();
-    let maybe_tty_mode = &mut fs_file_resource.1.as_mut().unwrap().tty.mode;
+    // SAFETY: Nix crate requires value to implement the AsFd trait
+    let raw_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(handle_or_fd) };
 
     if is_raw {
-      if maybe_tty_mode.is_none() {
-        // Save original mode.
-        let original_mode = termios::tcgetattr(raw_fd)?;
-        maybe_tty_mode.replace(original_mode);
-      }
-
-      let mut raw = maybe_tty_mode.clone().unwrap();
+      let mut raw = match previous_mode {
+        Some(mode) => mode,
+        None => {
+          // Save original mode.
+          let original_mode = termios::tcgetattr(raw_fd)
+            .map_err(|e| TtyError::Nix(JsNixError(e)))?;
+          tty_mode_store.set(rid, original_mode.clone());
+          original_mode
+        }
+      };
 
       raw.input_flags &= !(termios::InputFlags::BRKINT
         | termios::InputFlags::ICRNL
@@ -202,120 +304,184 @@ fn op_set_raw(
       }
       raw.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 1;
       raw.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
-      termios::tcsetattr(raw_fd, termios::SetArg::TCSADRAIN, &raw)?;
+      termios::tcsetattr(raw_fd, termios::SetArg::TCSADRAIN, &raw)
+        .map_err(|e| TtyError::Nix(JsNixError(e)))?;
     } else {
       // Try restore saved mode.
-      if let Some(mode) = maybe_tty_mode.take() {
-        termios::tcsetattr(raw_fd, termios::SetArg::TCSADRAIN, &mode)?;
+      if let Some(mode) = tty_mode_store.take(rid) {
+        termios::tcsetattr(raw_fd, termios::SetArg::TCSADRAIN, &mode)
+          .map_err(|e| TtyError::Nix(JsNixError(e)))?;
       }
     }
 
-    Ok(json!({}))
+    Ok(())
   }
 }
 
-#[derive(Deserialize)]
-pub struct IsattyArgs {
-  rid: ResourceId,
-}
-
-fn op_isatty(
-  state: &mut OpState,
-  args: IsattyArgs,
-  _zero_copy: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  let rid = args.rid;
-
-  let isatty: bool = StdFileResource::with(state, rid, move |r| match r {
-    Ok(std_file) => {
-      #[cfg(windows)]
-      {
-        use winapi::um::consoleapi;
-
-        let handle = get_windows_handle(&std_file)?;
-        let mut test_mode: DWORD = 0;
-        // If I cannot get mode out of console, it is not a console.
-        Ok(unsafe { consoleapi::GetConsoleMode(handle, &mut test_mode) != 0 })
-      }
-      #[cfg(unix)]
-      {
-        use std::os::unix::io::AsRawFd;
-        let raw_fd = std_file.as_raw_fd();
-        Ok(unsafe { libc::isatty(raw_fd as libc::c_int) == 1 })
-      }
-    }
-    _ => Ok(false),
-  })?;
-  Ok(json!(isatty))
-}
-
-#[derive(Deserialize)]
-pub struct ConsoleSizeArgs {
-  rid: ResourceId,
-}
-
-#[derive(Serialize)]
-struct ConsoleSize {
-  columns: u32,
-  rows: u32,
-}
-
+#[op2(fast)]
 fn op_console_size(
   state: &mut OpState,
-  args: ConsoleSizeArgs,
-  _zero_copy: &mut [ZeroCopyBuf],
-) -> Result<ConsoleSize, AnyError> {
-  super::check_unstable(state, "Deno.consoleSize");
+  #[buffer] result: &mut [u32],
+) -> Result<(), TtyError> {
+  fn check_console_size(
+    state: &mut OpState,
+    result: &mut [u32],
+    rid: u32,
+  ) -> Result<(), TtyError> {
+    let fd = state.resource_table.get_fd(rid)?;
+    let size = console_size_from_fd(fd)?;
+    result[0] = size.cols;
+    result[1] = size.rows;
+    Ok(())
+  }
 
-  let rid = args.rid;
-
-  let size = StdFileResource::with(state, rid, move |r| match r {
-    Ok(std_file) => {
-      #[cfg(windows)]
-      {
-        use std::os::windows::io::AsRawHandle;
-        let handle = std_file.as_raw_handle();
-
-        unsafe {
-          let mut bufinfo: winapi::um::wincon::CONSOLE_SCREEN_BUFFER_INFO =
-            std::mem::zeroed();
-
-          if winapi::um::wincon::GetConsoleScreenBufferInfo(
-            handle,
-            &mut bufinfo,
-          ) == 0
-          {
-            return Err(Error::last_os_error().into());
-          }
-
-          Ok(ConsoleSize {
-            columns: bufinfo.dwSize.X as u32,
-            rows: bufinfo.dwSize.Y as u32,
-          })
-        }
-      }
-
-      #[cfg(unix)]
-      {
-        use std::os::unix::io::AsRawFd;
-
-        let fd = std_file.as_raw_fd();
-        unsafe {
-          let mut size: libc::winsize = std::mem::zeroed();
-          if libc::ioctl(fd, libc::TIOCGWINSZ, &mut size as *mut _) != 0 {
-            return Err(Error::last_os_error().into());
-          }
-
-          // TODO (caspervonb) return a tuple instead
-          Ok(ConsoleSize {
-            columns: size.ws_col as u32,
-            rows: size.ws_row as u32,
-          })
-        }
-      }
+  let mut last_result = Ok(());
+  // Since stdio might be piped we try to get the size of the console for all
+  // of them and return the first one that succeeds.
+  for rid in [0, 1, 2] {
+    last_result = check_console_size(state, result, rid);
+    if last_result.is_ok() {
+      return last_result;
     }
-    Err(_) => Err(bad_resource_id()),
-  })?;
+  }
 
-  Ok(size)
+  last_result
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct ConsoleSize {
+  pub cols: u32,
+  pub rows: u32,
+}
+
+pub fn console_size(
+  std_file: &std::fs::File,
+) -> Result<ConsoleSize, std::io::Error> {
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::AsRawHandle;
+    let handle = std_file.as_raw_handle();
+    console_size_from_fd(handle)
+  }
+  #[cfg(unix)]
+  {
+    use std::os::unix::io::AsRawFd;
+    let fd = std_file.as_raw_fd();
+    console_size_from_fd(fd)
+  }
+}
+
+#[cfg(windows)]
+fn console_size_from_fd(
+  handle: std::os::windows::io::RawHandle,
+) -> Result<ConsoleSize, std::io::Error> {
+  // SAFETY: winapi calls
+  unsafe {
+    let mut bufinfo: winapi::um::wincon::CONSOLE_SCREEN_BUFFER_INFO =
+      std::mem::zeroed();
+
+    if winapi::um::wincon::GetConsoleScreenBufferInfo(handle, &mut bufinfo) == 0
+    {
+      return Err(Error::last_os_error());
+    }
+
+    // calculate the size of the visible window
+    // * use over/under-flow protections b/c MSDN docs only imply that srWindow components are all non-negative
+    // * ref: <https://docs.microsoft.com/en-us/windows/console/console-screen-buffer-info-str> @@ <https://archive.is/sfjnm>
+    let cols = std::cmp::max(
+      bufinfo.srWindow.Right as i32 - bufinfo.srWindow.Left as i32 + 1,
+      0,
+    ) as u32;
+    let rows = std::cmp::max(
+      bufinfo.srWindow.Bottom as i32 - bufinfo.srWindow.Top as i32 + 1,
+      0,
+    ) as u32;
+
+    Ok(ConsoleSize { cols, rows })
+  }
+}
+
+#[cfg(not(windows))]
+fn console_size_from_fd(
+  fd: std::os::unix::prelude::RawFd,
+) -> Result<ConsoleSize, std::io::Error> {
+  // SAFETY: libc calls
+  unsafe {
+    let mut size: libc::winsize = std::mem::zeroed();
+    if libc::ioctl(fd, libc::TIOCGWINSZ, &mut size as *mut _) != 0 {
+      return Err(Error::last_os_error());
+    }
+    Ok(ConsoleSize {
+      cols: size.ws_col as u32,
+      rows: size.ws_row as u32,
+    })
+  }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+  #[test]
+  fn test_winos_raw_mode_transitions() {
+    use crate::ops::tty::mode_raw_input_off;
+    use crate::ops::tty::mode_raw_input_on;
+
+    let known_off_modes =
+      [0xf7 /* Win10/CMD */, 0x1f7 /* Win10/WinTerm */];
+    let known_on_modes =
+      [0x2f0 /* Win10/CMD */, 0x3f0 /* Win10/WinTerm */];
+
+    // assert known transitions
+    assert_eq!(known_on_modes[0], mode_raw_input_on(known_off_modes[0]));
+    assert_eq!(known_on_modes[1], mode_raw_input_on(known_off_modes[1]));
+
+    // assert ON-OFF round-trip is neutral
+    assert_eq!(
+      known_off_modes[0],
+      mode_raw_input_off(mode_raw_input_on(known_off_modes[0]))
+    );
+    assert_eq!(
+      known_off_modes[1],
+      mode_raw_input_off(mode_raw_input_on(known_off_modes[1]))
+    );
+  }
+}
+
+deno_error::js_error_wrapper!(ReadlineError, JsReadlineError, |err| {
+  match err {
+    ReadlineError::Io(e) => e.get_class(),
+    ReadlineError::Eof => GENERIC_ERROR.into(),
+    ReadlineError::Interrupted => GENERIC_ERROR.into(),
+    #[cfg(unix)]
+    ReadlineError::Errno(e) => JsNixError(*e).get_class(),
+    _ => GENERIC_ERROR.into(),
+  }
+});
+
+#[op2]
+#[string]
+pub fn op_read_line_prompt(
+  #[string] prompt_text: &str,
+  #[string] default_value: &str,
+) -> Result<Option<String>, JsReadlineError> {
+  let mut editor = Editor::<(), rustyline::history::DefaultHistory>::new()
+    .expect("Failed to create editor.");
+
+  editor.set_keyseq_timeout(Some(1));
+  editor
+    .bind_sequence(KeyEvent(KeyCode::Esc, Modifiers::empty()), Cmd::Interrupt);
+
+  let read_result =
+    editor.readline_with_initial(prompt_text, (default_value, ""));
+  match read_result {
+    Ok(line) => Ok(Some(line)),
+    Err(ReadlineError::Interrupted) => {
+      // SAFETY: Disable raw mode and raise SIGINT.
+      unsafe {
+        libc::raise(libc::SIGINT);
+      }
+      Ok(None)
+    }
+    Err(ReadlineError::Eof) => Ok(None),
+    Err(err) => Err(JsReadlineError(err)),
+  }
 }
